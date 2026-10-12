@@ -289,6 +289,13 @@ details.env-d .kv2{padding:0 0 12px;font-size:15px}
 .term b{display:block}
 
 
+details.fold{background:var(--surface);border-radius:var(--r);box-shadow:var(--shadow)}
+details.fold>summary{list-style:none;display:flex;justify-content:space-between;align-items:center;gap:10px;padding:16px;font-weight:600;cursor:pointer}
+details.fold>summary::-webkit-details-marker{display:none}
+details.fold>summary::after{content:"›";font-size:22px;color:var(--muted);transition:transform .2s}
+details.fold[open]>summary::after{transform:rotate(90deg)}
+details.fold .in{padding:0 14px 16px}
+details.fold .list{box-shadow:none;background:var(--surface2)}
 /* vue d'ensemble */
 .kpis{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:6px}
 .kpi{background:var(--surface);border-radius:var(--r);padding:14px;box-shadow:var(--shadow)}
@@ -759,6 +766,7 @@ const Backend=(function(){
       l.color=colorOr(p.color,ex?ex.color:C.green);
       if(p.active!==undefined)l.active=!!p.active;
       if(p.paused!==undefined)l.paused=!!p.paused;
+      if(p.support!==undefined)l.support=String(p.support||'').trim().slice(0,40);
       if(!ex)db.livrets.push(l);
       return {id:l.id};
     },
@@ -1004,7 +1012,7 @@ function insights(st){
     }
     if(st.savings>0){
       if(st.savedNet+0.005>=st.savings)out.push({sev:3,tone:'ok',title:'Objectif d\'épargne atteint',text:eur(st.savedNet)+' mis de côté sur '+eur(st.savings)+' prévus.'});
-      else out.push({sev:2,tone:'info',title:'Épargne à virer',text:'Il reste '+eur(st.savings-st.savedNet)+' à mettre de côté ce cycle.',act:'addSaving',label:'Enregistrer un virement'});
+      else out.push({sev:2,tone:'info',title:'Épargne à virer',text:'Il reste '+eur(st.savings-st.savedNet)+' à mettre de côté ce cycle.',act:'gotoSave',label:'Voir mes virements'});
     }
     if(typeof unusualExpense==='function'){
       const u=unusualExpense(st);
@@ -1014,7 +1022,7 @@ function insights(st){
       UI.detected=detectRecurring();
       UI.detected.slice(0,1).forEach((g,i)=>out.push({sev:2,tone:'info',title:'Un prélèvement caché ?',text:'« '+g.label+' » ('+eur(g.amount)+') revient à chaque cycle vers le '+g.day+'. Ajoute-le aux prélèvements pour qu\'il soit compté automatiquement.',act:'recDetect',arg:i,label:'Ajouter aux prélèvements'}));
     }
-    if(st.income>0&&st.unallocated>st.income*0.05)out.push({sev:2,tone:'info',title:eurR(st.unallocated)+' non affectés',text:'Cet argent n\'est dans aucune enveloppe : touche pour le répartir.',act:'distribute',label:'Répartir'});
+    if(st.income>0&&st.unallocated>st.income*0.05)out.push({sev:2,tone:'info',title:eurR(st.unallocated)+' à répartir',text:'Cet argent n\'est dans aucune enveloppe : touche pour le répartir.',act:'distribute',label:'Répartir'});
   }
   const lb=S.settings.lastBackup;
   if(S.operations.length>=10&&(!lb||D.diff(lb,S.today)>30))out.push({sev:2,tone:'info',title:'Pense à sauvegarder',text:lb?'Dernière sauvegarde il y a '+D.diff(lb,S.today)+' jours.':'Tu n\'as encore jamais exporté tes données.',act:'backup',label:'Faire une sauvegarde'});
@@ -1136,24 +1144,23 @@ function goalProgress(g){
   return {cur,pct,perCycle,daysLeft,done:cur>=g.target};
 }
 
-/* Répartition d'un montant entre les livrets :
-   matelas d'abord (option), puis stratégie ; respecte les plafonds et les livrets en pause */
+/* Répartition d'un montant entre mes comptes : matelas de sécurité d'abord (option),
+   puis ma répartition (en % par compte). Plafonds et comptes en pause respectés. */
 function allocate(amount,opts){
   opts=opts||{};
-  const strat=strategyState();
+  const strat=strategyState(),plan=strat.plan||{};
   const cushionFirst=opts.cushionFirst!=null?opts.cushionFirst:strat.cushionFirst!==false;
   const left={};S.livrets.forEach(l=>left[l.id]=livretRoom(l));
   const cand=S.livrets.filter(canReceive);
   const skipped=[];
   const note=(name,why)=>{if(!skipped.some(x=>x.name===name&&x.why===why))skipped.push({name,why});};
-  S.livrets.filter(l=>l.active).forEach(l=>{if(l.paused)note(l.name,'versements en pause');else if(livretRoom(l)<1)note(l.name,'plafond atteint');});
+  Object.keys(plan).forEach(id=>{const l=livretById(id);if(!l)return;if(l.paused)note(l.name,'versements en pause');else if(livretRoom(l)<1)note(l.name,'plafond atteint');});
   const lines={};let R=Math.max(0,amount);
-  const put=(l,amt,why,sup)=>{
+  const put=(l,amt,why)=>{
     amt=Math.min(amt,left[l.id]);
     if(!(amt>0.005))return 0;
     left[l.id]-=amt;
-    const key=l.id+'|'+(sup||'');
-    const e=lines[key]||(lines[key]={livretId:l.id,amount:0,why:[],support:sup||''});
+    const e=lines[l.id]||(lines[l.id]={livretId:l.id,amount:0,why:[],support:l.support||''});
     e.amount+=amt;if(why&&e.why.indexOf(why)<0)e.why.push(why);
     return amt;
   };
@@ -1162,43 +1169,20 @@ function allocate(amount,opts){
   const cu=cushion();
   const gap=Math.max(0,cu.min-cu.safe);
   let toCushion=0;
-  if(cushionFirst&&R>=1&&gap>0){toCushion=putSafe(Math.min(R,gap),'Complète ton matelas de sécurité');R-=toCushion;}
-  const rows=(strat.rows||[]).filter(r=>+r.pct>0),totPct=sum(rows,r=>+r.pct);
-  const cushionDone=!cushionFirst||gap<=toCushion+0.5;
-  if(R>=1&&rows.length&&totPct>0&&cushionDone){
-    const cap=rows.map(r=>sum(cand.filter(l=>l.kind===r.kind),l=>left[l.id]));
-    let w=rows.map(r=>+r.pct);
-    if(opts.useGap){
-      const tv=sum(S.livrets.filter(l=>l.active),l=>livretValue(l)),after=tv+R;
-      const gaps=rows.map(r=>{
-        const tgt=after*(+r.pct)/totPct;
-        const act=sum(S.livrets.filter(l=>l.active&&l.kind===r.kind),l=>livretValue(l));
-        return Math.max(0,tgt-act);
-      });
-      if(sum(gaps)>0.5)w=gaps;
-    }
-    const give=rows.map(()=>0);let rest=R,act=rows.map((r,i)=>i).filter(i=>cap[i]>=1&&w[i]>0);
+  if(cushionFirst&&R>=1&&gap>0){toCushion=putSafe(Math.min(R,gap),'Matelas de sécurité en priorité');R-=toCushion;}
+  const items=Object.keys(plan).map(id=>({l:livretById(id),w:+plan[id]})).filter(x=>x.l&&canReceive(x.l));
+  const totW=sum(Object.keys(plan),id=>+plan[id]);
+  if(R>=1&&items.length){
+    const give=items.map(()=>0);let rest=R,act=items.map((x,i)=>i);
     for(let it=0;it<12&&rest>=0.5&&act.length;it++){
-      const W=sum(act,i=>w[i]);let spent=0;const next=[];
-      act.forEach(i=>{
-        const want=rest*w[i]/W,can=cap[i]-give[i],g=Math.min(want,can);
-        give[i]+=g;spent+=g;if(can-g>=1)next.push(i);
-      });
+      const W=sum(act,i=>items[i].w);let spent=0;const next=[];
+      act.forEach(i=>{const want=rest*items[i].w/W,can=left[items[i].l.id]-give[i],g=Math.min(want,can);give[i]+=g;spent+=g;if(can-g>=1)next.push(i);});
       rest-=spent;act=next;if(spent<0.01)break;
     }
-    rows.forEach((r,i)=>{
-      if(give[i]<=0)return;
-      let g=give[i];
-      cand.filter(l=>l.kind===r.kind).sort((a,b)=>left[b.id]-left[a.id]).forEach(l=>{if(g<0.005)return;g-=put(l,g,'Selon ta stratégie : '+r.label,(KINDS[r.kind]||KINDS.autre).safe?'':r.label);});
-    });
+    items.forEach((x,i)=>{if(give[i]>0)put(x.l,give[i],'Ta répartition : '+Math.round(x.w/totW*100)+' %');});
     R=rest;
-    rows.forEach((r,i)=>{
-      if(cap[i]>=1)return;
-      const li=S.livrets.find(l=>l.active&&l.kind===r.kind);
-      note(r.label,!li?'aucun compte '+(KINDS[r.kind]||KINDS.autre).label+' ouvert':(li.paused?'versements en pause':'plafond atteint'));
-    });
   }
-  if(R>=1){const p=putSafe(R,gap>0?'Complète ton matelas de sécurité':(rows.length?'Reste de la répartition':'Meilleur taux sans risque'));R-=p;}
+  if(R>=1){const p=putSafe(R,gap>0&&cushionFirst?'Matelas de sécurité en priorité':(items.length?'Reporté : plafond atteint ou compte en pause':'Meilleur taux sans risque'));R-=p;}
   const arr=Object.keys(lines).map(k=>lines[k]);
   const total=sum(arr,l=>l.amount);
   const fl=arr.map(l=>Math.floor(l.amount));
@@ -1206,7 +1190,16 @@ function allocate(amount,opts){
   arr.map((l,i)=>[l.amount-Math.floor(l.amount),i]).sort((x,y)=>y[0]-x[0]).forEach(o=>{if(rem>0){fl[o[1]]++;rem--;}});
   arr.forEach((l,i)=>{l.amount=fl[i];l.why=l.why.join(' · ');});
   const out=arr.filter(l=>l.amount>0);
-  return {lines:out,kept:Math.max(0,Math.max(0,amount)-sum(out,l=>l.amount)),skipped,gap,cu,hasStrategy:rows.length>0,cushionFirst};
+  return {lines:out,kept:Math.max(0,Math.max(0,amount)-sum(out,l=>l.amount)),skipped,gap,cu,hasPlan:Object.keys(plan).length>0,hasStrategy:Object.keys(plan).length>0,cushionFirst};
+}
+/* plan d'épargne du cycle : combien sur chaque compte, et ce qui est déjà viré */
+function savingsPlan(c){
+  const st=stats(c),al=allocate(st.savings,{}),done={};
+  st.ops.filter(o=>o.type==='epargne').forEach(o=>{done[o.livretId]=(done[o.livretId]||0)+o.amount;});
+  const lines=al.lines.map(l=>Object.assign({},l,{done:r2(done[l.livretId]||0)}));
+  Object.keys(done).forEach(id=>{if(!lines.some(l=>l.livretId===id)&&livretById(id))lines.push({livretId:id,amount:0,done:r2(done[id]),why:'en plus de ta répartition',support:''});});
+  const todo=lines.filter(l=>l.amount-l.done>=1).map(l=>({livretId:l.livretId,amount:r2(l.amount-l.done),support:l.support}));
+  return {lines,todo,total:st.savings,doneTotal:r2(sum(Object.keys(done),id=>done[id])),al};
 }
 
 /* Bilan de fin de cycle : que faire de l'argent non dépensé ? */
@@ -1216,16 +1209,28 @@ function buildBilan(c){
   const projectedLeft=Math.max(0,st.available-st.avgDaily*remainingDays);
   const usable=Math.max(0,f5(projectedLeft*0.9));
   const reward=usable>=20?r5(usable*0.15):0;
-  const al=allocate(usable-reward,{useGap:true});
+  const al=allocate(usable-reward,{});
   return {st,projectedLeft,usable,reward,lines:al.lines,gap:al.gap,cu:al.cu,hasStrategy:al.hasStrategy,skipped:al.skipped,
     kept:Math.max(0,usable-reward-sum(al.lines,l=>l.amount))};
 }
 
 function learnState(){try{const v=JSON.parse(S.settings.learn||'{}');return {done:v.done||{},quiz:v.quiz||{}};}catch(e){return {done:{},quiz:{}};}}
 function strategyState(){
-  const d={goal:'',horizon:10,risk:3,rules:'',rows:[],reviewed:'',cushionFirst:true,tol:5,profile:null};
-  try{return Object.assign(d,JSON.parse(S.settings.strategy||'{}'));}catch(e){return d;}
+  const d={goal:'',horizon:10,risk:3,rules:'',rows:[],reviewed:'',cushionFirst:true,tol:5,profile:null,plan:null};
+  let o=d;try{o=Object.assign(d,JSON.parse(S.settings.strategy||'{}'));}catch(e){o=d;}
+  const act=S.livrets.filter(l=>l.active);
+  if(!o.plan||typeof o.plan!=='object'){
+    o.plan={};
+    (o.rows||[]).forEach(r=>{const l=act.find(x=>x.kind===r.kind);if(l)o.plan[l.id]=(o.plan[l.id]||0)+(+r.pct||0);});
+    if(!Object.keys(o.plan).length){
+      const l=act.filter(x=>!x.paused).sort((x,y)=>((KINDS[y.kind]||KINDS.autre).safe-(KINDS[x.kind]||KINDS.autre).safe)||((y.rate||0)-(x.rate||0)))[0];
+      if(l)o.plan[l.id]=100;
+    }
+  }
+  Object.keys(o.plan).forEach(id=>{const l=livretById(id);if(!l||!l.active||!(+o.plan[id]>0))delete o.plan[id];});
+  return o;
 }
+
 
 /* aides à la saisie : catégories les plus utilisées, dépenses récurrentes */
 function catUsage(){
@@ -1386,46 +1391,44 @@ function render(){
 }
 
 /* ---------- Accueil ---------- */
+/* liste unique de ce qu'il y a à faire, par ordre d'importance */
+function todoItems(st){
+  const out=[];
+  if(st.late>=1)out.push({icon:'💶',t:'Ta paie est arrivée ?',s:'Démarre le nouveau cycle : tes revenus sont déjà remplis',act:'newCycle'});
+  if(bilanWindow(st))out.push({icon:'🎈',t:'Bilan de fin de cycle',s:'Que faire de ce que tu n\'as pas dépensé',act:'bilan'});
+  if(st.income>0&&st.unallocated>=1)out.push({icon:'🧩',t:eurR(st.unallocated)+' à répartir',s:'Cet argent n\'est dans aucune enveloppe : touche pour le répartir',act:'distribute'});
+  if(st.income>0&&st.unallocated<=-1)out.push({icon:'⚠️',t:'Budget trop haut de '+eurR(-st.unallocated),s:'Touche pour ajuster automatiquement',act:'distribute'});
+  const sp=savingsPlan(st.c),todo=sum(sp.todo,x=>x.amount);
+  if(todo>=1){const l0=livretById(sp.todo[0].livretId);out.push({icon:'🌱',t:'Virer '+eurR(todo)+' vers ton épargne',s:sp.todo.length>1?'Sur '+sp.todo.length+' comptes':'Sur '+(l0?l0.name:'ton livret'),act:'gotoSave'});}
+  st.rows.filter(r=>r.cat.id&&r.status==='over').slice(0,1).forEach(r=>out.push({icon:r.cat.icon,t:r.cat.name+' dépassé de '+eurR(r.spent-r.budget),s:'Change son budget ou dépense moins ailleurs',act:'editBudget',id:r.cat.id}));
+  if(!S.livrets.some(l=>(livretBalances()[l.id]||0)>0))out.push({icon:'🏦',t:'Indique ce que tu as déjà de côté',s:'Ajoute tes livrets et leur solde',act:'gotoSave'});
+  const lb=S.settings.lastBackup;
+  if(S.operations.length>=3&&(!lb||D.diff(lb,S.today)>25))out.push({icon:'💾',t:'Sauvegarder tes données',s:lb?'Dernière sauvegarde il y a '+D.diff(lb,S.today)+' jours':'Une touche suffit, au cas où tu changes de téléphone',act:'backup'});
+  if(typeof detectRecurring==='function'){UI.detected=detectRecurring();if(UI.detected[0])out.push({icon:'🔁',t:'« '+UI.detected[0].label+' » revient chaque mois',s:'L\'ajouter aux prélèvements automatiques',act:'recDetect',id:'0'});}
+  return out;
+}
 function viewHome(){
   const c=currentCycle();
   if(!c)return emptyNoCycle();
-  const st=stats(c),p=profileById(c.profileId);
-  const neg=st.available<0,un=st.unallocated;
-  let h='<section class="hero"><div class="chips">'+
-    '<button class="chip" data-act="pickProfile" aria-label="Changer de profil">'+(p?esc(p.icon)+' '+esc(p.name):'Profil')+' ▾</button>'+
-    '<span class="chip static">'+(st.late>0?'jour '+(st.since+1)+' · +'+st.late+' j':st.daysLeft+' j restants')+'</span>'+
-    (st.income>0&&Math.abs(un)>=1?'<button class="chip" style="color:'+(un>0?'var(--tint)':'var(--neg)')+'" data-act="distribute">'+(un>0?eurR(un)+' non affectés · répartir':'Budget trop haut de '+eurR(-un)+' · ajuster')+'</button>':'')+'</div>'+
-    '<div class="wheel" data-act="calcSheet" role="button" tabindex="0" aria-label="Voir comment le montant est calculé" style="cursor:pointer">'+wheelSvg(st,!UI.animated)+'<div class="c"><div class="lbl">'+(neg?'Dépassé de':'Reste à dépenser')+'</div>'+
-    '<div class="big'+(neg?' neg':'')+'">'+eurR(Math.abs(st.available))+'</div>'+
-    '<div class="perday">'+(st.envBudget>0?(neg?'sur tes enveloppes':'≈ '+eurR(Math.max(0,st.perDay))+' par jour'):'ajoute des enveloppes')+'</div></div></div>'+
-    '<p class="help" style="text-align:center;margin:8px 8px 0">Anneau coloré : ce qu\'il reste dans chaque enveloppe. Trait gris : avancement du cycle. Touche la roue pour voir le calcul.</p>'+
-    '<div class="statrow"><div class="stat"><b class="num">'+eurR(st.envSpent)+'</b><span>dépensé sur '+eurR(st.envBudget)+' prévus</span></div>'+
-    '<div class="stat"><b class="num">'+eurR(Math.max(0,st.savedNet))+'</b><span>épargné sur '+eurR(st.savings)+' prévus</span></div>'+
-    '<div class="stat"><b class="num">'+eurR(st.P)+'</b><span>prélevé automatiquement</span></div></div>';
-  const ins=insights(st);
-  if(ins.length){
-    const i=ins[0];
-    h+='<button class="banner" data-act="'+(i.act==='bilan'?'bilan':'insights')+'"><span class="dot '+i.tone+'"></span><div><div class="t">'+esc(i.title)+'</div><div class="x">'+esc(i.text)+'</div></div><span class="go">›</span></button>';
-  }
-  h+='<div style="text-align:center;margin-top:16px"><button class="btn ghost sm" data-act="newCycle">J\'ai été payé · nouveau cycle</button></div></section>';
-
+  const st=stats(c),neg=st.available<0;
+  let h='<section class="hero"><div class="wheel" data-act="calcSheet" role="button" tabindex="0" aria-label="Voir comment le montant est calculé" style="cursor:pointer">'+wheelSvg(st,!UI.animated)+
+    '<div class="c"><div class="lbl">'+(neg?'Dépassé de':'Reste à dépenser')+'</div><div class="big'+(neg?' neg':'')+'">'+eurR(Math.abs(st.available))+'</div>'+
+    '<div class="perday">'+(st.envBudget>0?(neg?'sur tes enveloppes':'≈ '+eurR(Math.max(0,st.perDay))+' par jour · '+st.daysLeft+' j'):'ajoute des enveloppes')+'</div></div></div>'+
+    '<p class="help" style="text-align:center;margin:6px 8px 0">Touche la roue pour voir le détail</p>'+
+    '<div class="statrow"><div class="stat"><b class="num">'+eurR(st.envSpent)+'</b><span>dépensé sur '+eurR(st.envBudget)+'</span></div>'+
+    '<div class="stat"><b class="num">'+eurR(Math.max(0,st.savedNet))+'</b><span>épargné sur '+eurR(st.savings)+'</span></div>'+
+    '<div class="stat"><b class="num">'+eurR(st.P)+'</b><span>prélevé</span></div></div></section>';
+  const todo=todoItems(st);
+  const row=i=>'<button class="row" data-act="'+i.act+'"'+(i.id!=null?' data-id="'+esc(i.id)+'"':'')+'><span class="badge" style="background:var(--surface2)">'+esc(i.icon)+'</span><div class="grow"><div class="t">'+esc(i.t)+'</div><div class="s" style="white-space:normal">'+esc(i.s)+'</div></div><span class="chev">›</span></button>';
+  h+='<section class="sec"><div class="sec-h"><h2>À faire</h2>'+(insights(st).length?'<button class="link" data-act="insights">Conseils</button>':'')+'</div><div class="list">'+
+    (todo.length?todo.slice(0,4).map(row).join(''):'<div class="row"><span class="badge" style="background:rgba(52,199,89,.16)">✓</span><div class="grow"><div class="t">Tout est à jour</div><div class="s">Rien à faire pour l\'instant</div></div></div>')+
+    (st.late>=1?'':'<button class="row nobadge" data-act="newCycle"><div class="grow"><div class="t" style="color:var(--tint)">J\'ai été payé</div><div class="s">Démarrer le cycle suivant</div></div><span class="chev">›</span></button>')+'</div></section>';
   const env=st.rows.filter(r=>r.cat.id);
-  h+='<section class="sec"><div class="sec-h"><h2>Enveloppes</h2><button class="link" data-act="tab" data-id="budget">Budget</button></div>';
-  if(env.length)h+='<div class="ringgrid">'+env.map(envTile).join('')+'</div><p class="help">Touche une enveloppe pour y ajouter une dépense. Le montant sous le nom est ce qu\'il te reste.</p>';
-  else h+='<div class="panel pad muted">Aucune enveloppe. Ajoute des catégories dans Budget.</div>';
+  h+='<section class="sec"><div class="sec-h"><h2>Mes enveloppes</h2></div>';
+  h+=env.length?'<div class="ringgrid">'+env.map(envTile).join('')+'</div><p class="help">Touche une enveloppe pour y ajouter une dépense.</p>':'<div class="panel pad muted">Aucune enveloppe. Ajoute-en dans Budget.</div>';
   h+='</section>';
-
-  if(st.savings>0||st.savedNet>0){
-    const pct=st.savings>0?st.savedNet/st.savings:1;
-    h+='<section class="sec"><div class="sec-h"><h2>Épargne du cycle</h2></div><button class="list row nobadge" style="display:flex;gap:14px" data-act="addSaving"><div class="ring" style="width:56px;height:56px">'+ringSvg(pct,'#34C759',false,56,6)+'<span class="em" style="font-size:20px">🌱</span></div>'+
-      '<div class="grow"><div class="t num">'+eur(Math.max(0,st.savedNet))+' <span class="muted" style="font-weight:400">épargnés sur '+eur(st.savings)+' prévus</span></div><div class="s">'+(st.savedNet>=st.savings?'Objectif atteint':'Touche pour enregistrer un virement')+(st.bonusSaved>0?' · +'+eurR(st.bonusSaved)+' de rentrées épargnées':'')+'</div></div><span class="chev">›</span></button></section>';
-  }
-
-  const last=S.operations.slice().sort((a,b)=>a.date<b.date?1:(a.date>b.date?-1:0)).slice(0,4);
-  h+='<section class="sec"><div class="sec-h"><h2>Dernières opérations</h2><button class="link" data-act="gotoHist">Tout voir</button></div>';
-  h+=last.length?'<div class="list">'+last.map(opRow).join('')+'</div>':'<div class="panel pad muted">Rien pour l\'instant. Touche le bouton + pour ajouter ta première dépense.</div>';
-  h+='</section>';
-  h+='<section class="sec"><div class="list"><button class="row nobadge" data-act="assistant"><div class="grow"><div class="t">✨ Poser une question</div><div class="s">« Puis-je dépenser 50 € ? », « Combien il me reste ? »</div></div><span class="chev">›</span></button><button class="row nobadge" data-act="overview"><div class="grow"><div class="t">📊 Vue globale</div><div class="s">Tout ton argent en graphiques</div></div><span class="chev">›</span></button><button class="row nobadge" data-act="tour"><div class="grow"><div class="t">💡 Comment ça marche ?</div><div class="s">La visite guidée en 2 minutes</div></div><span class="chev">›</span></button></div></section>';
+  const last=S.operations.slice().sort((a,b)=>a.date<b.date?1:(a.date>b.date?-1:0)).slice(0,3);
+  if(last.length)h+='<section class="sec"><div class="sec-h"><h2>Dernières opérations</h2><button class="link" data-act="gotoHist">Tout voir</button></div><div class="list">'+last.map(opRow).join('')+'</div></section>';
   return h;
 }
 
@@ -1447,39 +1450,34 @@ function planVsUsed(st){
 function viewBudget(){
   const c=currentCycle();
   if(!c)return emptyNoCycle();
-  const st=stats(c),income=st.income,un=st.unallocated;
+  const st=stats(c),income=st.income,un=st.unallocated,saved=Math.max(0,st.savedNet+st.bonusSaved);
   const items=[{label:'Prélèvements',color:C.gray,v:st.P}].concat(st.rows.filter(r=>r.cat.id&&r.budget>0).map(r=>({label:r.cat.name,color:r.cat.color,v:r.budget})),[{label:'Épargne',color:'#34C759',v:st.savings}]);
-  if(un>0.5)items.push({label:'Non affecté',color:'rgba(142,142,147,.35)',v:un});
+  if(un>0.5)items.push({label:'À répartir',color:'rgba(142,142,147,.35)',v:un});
   let h='<section class="panel pad"><div class="donutwrap">'+donutSegments(items,240,26,2.5)+'<div class="c"><span>Revenus du cycle</span><b class="num">'+eurR(income)+'</b></div></div>'+
     '<div class="leg">'+items.map(i=>'<div><i style="background:'+i.color+'"></i><span>'+esc(i.label)+'</span><b class="num">'+eurR(i.v)+'</b></div>').join('')+'</div>'+
-    (un>0.5?'<div class="callout tip" style="margin:14px 0 0"><b>Il reste '+eurR(un)+' à affecter</b>Cet argent n\'est dans aucune enveloppe pour l\'instant.<div style="margin-top:10px"><button class="btn sm" data-act="distribute">Répartir le reste</button></div></div>'
-      :(un<-0.5?'<div class="callout warn" style="margin:14px 0 0"><b>Tu prévois '+eurR(-un)+' de plus que tes revenus</b>Baisse une enveloppe ou laisse l\'appli ajuster.<div style="margin-top:10px"><button class="btn sm" data-act="distribute">Ajuster automatiquement</button></div></div>'
-      :'<p class="help" style="text-align:center;margin-top:12px">✓ Tout ton argent a un rôle.</p>'))+'</section>';
-
-  h+='<section class="sec"><div class="sec-h"><h2>Prévu et utilisé</h2></div>'+planVsUsed(st)+'</section>';
-
-  h+='<section class="sec"><div class="sec-h"><h2>Profil du mois</h2><button class="link" data-act="manageProfiles">Gérer</button></div><div class="chips">'+
-    S.profiles.map(p=>'<button class="chip" data-act="setProfile" data-id="'+esc(p.id)+'" aria-pressed="'+(p.id===c.profileId)+'">'+esc(p.icon)+' '+esc(p.name)+'</button>').join('')+'</div>'+
-    '<p class="help">Un profil règle ton épargne (Normal '+fnum((profileById('prof_normal')||{rate:20}).rate)+' %, Vacances moins, Restreint plus) et recalcule tes enveloppes variables. Rien d\'autre ne bouge.</p></section>';
-
-  h+='<section class="sec"><div class="sec-h"><h2>Revenus</h2><button class="link" data-act="editCycle">Modifier</button></div><div class="list">'+(incomeRows(c)||'<div class="row nobadge muted">Aucun revenu renseigné</div>')+'<button class="rowadd" data-act="addBonus">🎁 Ajouter une rentrée d\'argent</button></div></section>';
-
-  h+='<section class="sec"><div class="sec-h"><h2>Prélèvements automatiques</h2><span class="cap num">'+eurR(st.P)+'</span></div><div class="list">'+
-    st.fixed.slice().sort((a,b)=>(a.day||99)-(b.day||99)).map(f=>'<button class="row" data-act="editRec" data-id="'+esc(f.id)+'"><span class="badge" style="background:var(--surface2)">'+esc(f.icon)+'</span><div class="grow"><div class="t">'+esc(f.name)+'</div>'+(f.day?'<div class="s">le '+f.day+' de chaque mois</div>':'')+'</div><div class="amt">'+eur(f.amount)+'</div><span class="chev">›</span></button>').join('')+
-    '<button class="rowadd" data-act="newRec">＋ Ajouter un prélèvement</button></div><p class="help">Loyer, téléphone, assurance, abonnements… Comptés automatiquement, sans rien saisir.</p></section>';
-
-  const saved=Math.max(0,st.savedNet+st.bonusSaved);
-  h+='<section class="sec"><div class="sec-h"><h2>Épargne</h2></div><div class="list"><button class="row" data-act="editSavings"><span class="badge" style="background:rgba(52,199,89,.16)">🌱</span><div class="grow"><div class="t">Épargne prévue</div><div class="s">'+(income>0?fmtPct(st.savings/income*100)+' de tes revenus · ':'')+'déjà mis de côté : '+eur(saved)+'</div></div><div class="amt">'+eur(st.savings)+'</div><span class="chev">›</span></button></div></section>';
-
+    (un>0.5?'<div class="callout tip" style="margin:14px 0 0"><b>'+eurR(un)+' à répartir</b>Cet argent n\'est dans aucune enveloppe pour l\'instant.<div style="margin-top:10px"><button class="btn sm" data-act="distribute">Répartir dans mes enveloppes</button></div></div>'
+      :(un<-0.5?'<div class="callout warn" style="margin:14px 0 0"><b>Tu prévois '+eurR(-un)+' de plus que tes revenus</b>Baisse une enveloppe, ou laisse l\'appli ajuster.<div style="margin-top:10px"><button class="btn sm" data-act="distribute">Ajuster automatiquement</button></div></div>'
+      :'<p class="help" style="text-align:center;margin-top:12px">✓ Chaque euro de tes revenus a un rôle.</p>'))+'</section>';
   const fx=st.rows.filter(r=>r.cat.type==='fixe'&&r.cat.id),vr=st.rows.filter(r=>r.cat.type==='variable');
   const catRow=r=>{
     const k=r.cat,over=r.status==='over';
-    return '<button class="row" style="display:block" data-act="editBudget" data-id="'+esc(k.id)+'"><div style="display:flex;align-items:center;gap:12px">'+badge(k)+'<div class="grow"><div class="t">'+esc(k.name)+'</div><div class="s">'+(k.type==='fixe'?'montant fixe':'variable')+'</div></div><div class="amt">'+eur(r.budget)+'</div><span class="chev">›</span></div>'+
+    return '<button class="row" style="display:block" data-act="editBudget" data-id="'+esc(k.id)+'"><div style="display:flex;align-items:center;gap:12px">'+badge(k)+'<div class="grow"><div class="t">'+esc(k.name)+'</div><div class="s">'+(k.type==='fixe'?'montant fixe':'s\'adapte à ta paie')+'</div></div><div class="amt">'+eur(r.budget)+'</div><span class="chev">›</span></div>'+
       '<div style="margin:10px 0 0 48px">'+bar(r.pct,k.color,{over})+'<div class="env-f"><span>Utilisé '+eurR(r.spent)+'</span><span style="'+(over?'color:var(--neg);font-weight:600':'')+'">'+(over?'dépassé de '+eurR(r.spent-r.budget):'reste '+eurR(r.remaining))+'</span></div></div></button>';
   };
-  h+='<section class="sec"><div class="sec-h"><h2>Enveloppes</h2><span class="cap num">'+eurR(st.envBudget)+' prévus</span></div><div class="list">'+fx.concat(vr).map(catRow).join('')+'<button class="rowadd" data-act="newCat">＋ Ajouter une enveloppe</button></div>'+
-    '<p class="help">Montant prévu à gauche en gras ; en dessous, ce que tu as vraiment utilisé. Tes montants sont conservés tels quels : rien ne se recalcule tout seul.</p></section>';
-  h+='<section class="sec"><div style="display:grid;gap:10px"><button class="btn block" data-act="proposal">Proposition intelligente</button><button class="btn ghost block" data-act="recalc">Tout recalculer depuis mes revenus</button></div></section>';
+  h+='<section class="sec"><div class="sec-h"><h2>Mes enveloppes</h2><span class="cap num">'+eurR(st.envBudget)+' prévus</span></div><div class="list">'+
+    '<button class="row" style="display:block" data-act="editSavings"><div style="display:flex;align-items:center;gap:12px"><span class="badge" style="background:rgba(52,199,89,.16)">🌱</span><div class="grow"><div class="t">Épargne</div><div class="s">'+(income>0?fmtPct(st.savings/income*100)+' de tes revenus':'mise de côté')+'</div></div><div class="amt">'+eur(st.savings)+'</div><span class="chev">›</span></div>'+
+    '<div style="margin:10px 0 0 48px">'+bar(st.savings>0?saved/st.savings:0,'#34C759')+'<div class="env-f"><span>Mis de côté '+eurR(saved)+'</span><span>reste '+eurR(Math.max(0,st.savings-saved))+'</span></div></div></button>'+
+    fx.concat(vr).map(catRow).join('')+'<button class="rowadd" data-act="newCat">＋ Ajouter une enveloppe</button></div>'+
+    '<p class="help">Touche une ligne pour changer son montant prévu. Tes montants restent tels quels : rien ne se recalcule tout seul.</p></section>';
+  h+='<section class="sec"><div class="sec-h"><h2>Prévu et utilisé</h2></div>'+planVsUsed(st)+'</section>';
+  h+='<section class="sec"><details class="fold" id="budgetFold"'+(UI.foldOpen?' open':'')+'><summary><span>⚙️ Réglages du budget</span><span class="small muted">revenus, prélèvements, profil</span></summary><div class="in">'+
+    '<div class="lbl2" style="margin-top:4px">Profil du mois</div><div class="chips" style="margin-top:8px">'+S.profiles.map(p=>'<button class="chip" data-act="setProfile" data-id="'+esc(p.id)+'" aria-pressed="'+(p.id===c.profileId)+'">'+esc(p.icon)+' '+esc(p.name)+'</button>').join('')+'</div>'+
+    '<p class="help">Un profil règle ton épargne (Vacances : moins, Restreint : plus) et recalcule tes enveloppes qui s\'adaptent à ta paie.</p>'+
+    '<div class="sec-h" style="margin-top:18px"><h2 style="font-size:18px">Revenus</h2><button class="link" data-act="editCycle">Modifier</button></div><div class="list">'+(incomeRows(c)||'<div class="row nobadge muted">Aucun revenu renseigné</div>')+'<button class="rowadd" data-act="addBonus">🎁 Ajouter une rentrée d\'argent</button></div>'+
+    '<div class="sec-h" style="margin-top:18px"><h2 style="font-size:18px">Prélèvements automatiques</h2><span class="cap num">'+eurR(st.P)+'</span></div><div class="list">'+
+    st.fixed.slice().sort((a,b)=>(a.day||99)-(b.day||99)).map(f=>'<button class="row" data-act="editRec" data-id="'+esc(f.id)+'"><span class="badge" style="background:var(--surface2)">'+esc(f.icon)+'</span><div class="grow"><div class="t">'+esc(f.name)+'</div>'+(f.day?'<div class="s">le '+f.day+' de chaque mois</div>':'')+'</div><div class="amt">'+eur(f.amount)+'</div><span class="chev">›</span></button>').join('')+
+    '<button class="rowadd" data-act="newRec">＋ Ajouter un prélèvement</button></div>'+
+    '<div style="display:grid;gap:10px;margin-top:18px"><button class="btn block" data-act="proposal">Proposer un budget selon mes habitudes</button><button class="btn ghost block" data-act="recalc">Tout recalculer depuis mes revenus</button></div></div></details></section>';
   return h;
 }
 
@@ -1567,42 +1565,61 @@ function viewSavings(){
   const bal=livretBalances();
   const act=S.livrets.filter(l=>l.active),arch=S.livrets.filter(l=>!l.active);
   const total=sum(act,l=>livretValue(l));
-  const series=savingsSeries();
-  const net=sum(series,s=>s.net+s.bonus),inter=sum(series,s=>s.interest);
-  const cur=series.length?series[series.length-1]:null;
+  const series=savingsSeries(),cur=series.length?series[series.length-1]:null;
   const gains=sum(act.filter(l=>l.marketValue!=null),l=>livretValue(l)-investedAt(l,S.today));
-  let h='<section class="panel pad"><div class="small muted">Total épargné</div><div style="font:700 42px/1.1 var(--font);letter-spacing:-.035em" class="num">'+eur(total)+'</div>'+
-    '<div class="small muted" style="margin-top:6px">dont '+eur(net)+' mis de côté grâce à ton budget'+(inter>0?' · '+eur(inter)+' d\'intérêts':'')+(Math.abs(gains)>=1?' · '+(gains>=0?'+':'−')+eurR(Math.abs(gains))+' de plus-values':'')+(cur?' · ce cycle '+((cur.net+cur.bonus)>=0?'+':'')+eur(cur.net+cur.bonus):'')+'</div>'+
+  const c=currentCycle();
+  let h='<section class="panel pad"><div class="small muted">Toute ton épargne</div><div style="font:700 42px/1.1 var(--font);letter-spacing:-.035em" class="num">'+eur(total)+'</div>'+
+    '<div class="small muted" style="margin-top:6px">'+(cur?'Ce cycle : '+((cur.net+cur.bonus)>=0?'+':'')+eur(cur.net+cur.bonus):'')+(Math.abs(gains)>=1?(cur?' · ':'')+'plus-values : '+(gains>=0?'+':'−')+eurR(Math.abs(gains)):'')+'</div>'+
     (total>0?'<div style="margin-top:14px">'+donutBar(act.filter(l=>livretValue(l)>0).map(l=>({color:l.color,v:livretValue(l)})))+'</div>':'')+'</section>';
 
-  h+='<section class="sec"><div class="sec-h"><h2>Mes livrets</h2></div>';
-  h+='<div class="list">'+act.map(l=>{
-    const b=bal[l.id]||0,kd=KINDS[l.kind]||KINDS.autre,v=livretValue(l),room=livretRoom(l),full=l.ceiling>0&&room<1;
-    const meta=kd.label+(l.rate>0?' · '+fnum(l.rate)+' %':'')+(l.rate>0&&b>0&&kd.safe?' · ≈ '+eurR(b*l.rate/100)+'/an':'');
-    const tags=l.paused?'⏸ Versements en pause':(full?'Plafond atteint':'');
-    const blocked=l.paused||full;
-    return '<div class="row" style="display:block;padding:12px 16px"><div style="display:flex;align-items:center;gap:12px"><button class="badge" style="border:0;background:'+l.color+'26;color:'+l.color+';font-weight:700;font-size:13px" data-act="editLivret" data-id="'+esc(l.id)+'" aria-label="Modifier '+esc(l.name)+'">'+esc(kd.label.slice(0,2))+'</button>'+
-      '<button style="flex:1;min-width:0;text-align:left;background:none;border:0;padding:0" data-act="editLivret" data-id="'+esc(l.id)+'"><div class="t" style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(l.name)+'</div><div class="s" style="font-size:13px;color:var(--muted)">'+esc(meta)+'</div>'+(tags?'<div class="s" style="font-size:12.5px;color:var(--warn);font-weight:600">'+tags+'</div>':'')+'</button>'+
-      '<span class="amt num" style="font-size:17px">'+eur(v)+'</span><button class="btn sm'+(blocked?' ghost':'')+'" data-act="addSavingTo" data-id="'+esc(l.id)+'" aria-label="Virer vers '+esc(l.name)+'"'+(blocked?' style="opacity:.45"':'')+'>＋</button></div>'+
-      (l.ceiling>0?'<div style="margin:10px 0 0 48px">'+bar(b/l.ceiling,full?'#FF9500':l.color)+'<div class="env-f"><span>'+Math.round(b/l.ceiling*100)+' % du plafond</span><span>'+(full?'plein':eurR(room)+' de marge')+'</span></div></div>':'')+
-      (l.marketValue!=null&&!kd.safe?'<div class="small muted" style="margin:6px 0 0 48px">Versé '+eurR(investedAt(l,S.today))+' · valeur du '+dShort(l.valueDate)+'</div>':'')+'</div>';
-  }).join('')+'<button class="rowadd" data-act="addLivret">＋ Ajouter un livret ou un placement</button></div>';
-  h+='<div class="chips" style="margin-top:12px">'+['livret_a','ldds','lep','pel','pea','assurance_vie'].filter(k=>!act.some(l=>l.kind===k)).map(k=>'<button class="chip" data-act="addLivretKind" data-id="'+k+'">+ '+KINDS[k].label+'</button>').join('')+'</div>'+
-    '<p class="help">Touche un livret pour modifier son taux, son plafond, ou choisir de ne plus y verser.</p></section>';
+  if(c){
+    const sp=savingsPlan(c);
+    h+='<section class="sec"><div class="sec-h"><h2>Ce cycle</h2><button class="link" data-act="planEdit">Ma répartition</button></div><div class="list">';
+    if(!(sp.total>0)&&!sp.lines.length)h+='<div class="row nobadge"><div class="grow"><div class="t">Aucune épargne prévue ce cycle</div><div class="s" style="white-space:normal">Règle-la dans Budget › Épargne prévue.</div></div></div>';
+    else{
+      h+='<div class="row nobadge" style="display:block"><div class="env-h" style="margin-bottom:8px"><span class="n">'+eur(sp.doneTotal)+' mis de côté</span><span class="small muted num">sur '+eur(sp.total)+' prévus</span></div>'+bar(sp.total>0?sp.doneTotal/sp.total:1,'#34C759',{thick:true})+'</div>';
+      h+=sp.lines.map(l=>{
+        const lv=livretById(l.livretId);if(!lv)return '';
+        const done=l.amount>0&&l.done+0.5>=l.amount,rest=Math.max(0,l.amount-l.done);
+        return '<div class="row"><span class="badge" style="background:'+lv.color+'26;color:'+lv.color+';font-weight:700;font-size:13px">'+abbr(lv)+'</span><div class="grow"><div class="t">'+esc(lv.name)+(l.support?' · '+esc(l.support):'')+'</div><div class="s" style="white-space:normal">'+
+          (l.amount>0?(done?'✓ fait ('+eurR(l.done)+')':'à virer : '+eurR(rest)+(l.done>0?' · déjà '+eurR(l.done):'')):'versé '+eurR(l.done)+' en plus')+(l.why&&!done?' · '+esc(l.why):'')+'</div></div>'+
+          '<div class="amt'+(done?' pos':'')+'">'+(done?'✓':eurR(rest))+'</div></div>';
+      }).join('');
+    }
+    h+='</div>';
+    if(sp.todo.length)h+='<div style="margin-top:12px"><button class="btn block" data-act="planDo">J\'ai fait ces virements · '+eurR(sum(sp.todo,x=>x.amount))+'</button></div><p class="help">Fais les virements depuis ton appli de banque, puis touche ce bouton : l\'appli les enregistre d\'un coup.</p>';
+    if(sp.al.skipped.length)h+='<p class="help">'+sp.al.skipped.map(x=>esc(x.name)+' : '+esc(x.why)).join(' · ')+'</p>';
+    h+='</section>';
+  }
+
+  const cu=cushion();
+  if(cu.monthly>0){
+    const months=cu.safe/cu.monthly;
+    h+='<section class="sec"><div class="sec-h"><h2>Matelas de sécurité</h2></div><div class="panel pad"><div class="env-h" style="margin-bottom:8px"><span class="n">'+(months>=12?'Plus de 12':fnum(Math.round(months*10)/10))+' mois de dépenses</span><span class="small muted">objectif : 3 à 6</span></div>'+
+      bar(Math.min(1,months/6),months>=3?'#34C759':'#FF9500',{thick:true,tick:0.5})+'<p class="help" style="margin:8px 0 0">'+(months>=3?'Ton matelas est prêt : le reste de ton épargne peut aller vers tes projets ou la bourse.':'Il manque '+eurR(cu.min-cu.safe)+' sur tes livrets pour couvrir 3 mois de dépenses.')+'</p></div></section>';
+  }
+
+  h+='<section class="sec"><div class="sec-h"><h2>Mes comptes</h2></div><div class="list">'+act.map(l=>{
+    const b=bal[l.id]||0,kd=KINDS[l.kind]||KINDS.autre,v=livretValue(l),room=livretRoom(l),full=l.ceiling>0&&room<1,inv=!kd.safe;
+    const meta=kd.label+(l.rate>0?' · '+fnum(l.rate)+' %':'')+(l.rate>0&&b>0&&kd.safe?' · ≈ '+eurR(b*l.rate/100)+'/an':'')+(inv&&l.marketValue!=null?' · versé '+eurR(investedAt(l,S.today)):'');
+    const state=l.paused?'⏸ Versements en pause':(full?'Plafond atteint':'');
+    const g=inv&&l.marketValue!=null?v-investedAt(l,S.today):null;
+    return '<div class="row" style="display:block;padding:12px 16px"><div style="display:flex;align-items:center;gap:12px">'+
+      '<button style="display:flex;align-items:center;gap:12px;flex:1;min-width:0;text-align:left;background:none;border:0;padding:0" data-act="editLivret" data-id="'+esc(l.id)+'" aria-label="Modifier '+esc(l.name)+'"><span class="badge" style="background:'+l.color+'26;color:'+l.color+';font-weight:700;font-size:13px">'+abbr(l)+'</span>'+
+      '<span style="flex:1;min-width:0"><span class="t" style="display:block;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(l.name)+'</span><span class="s" style="display:block;font-size:13px;color:var(--muted)">'+esc(meta)+'</span>'+(state?'<span class="s" style="display:block;font-size:12.5px;color:var(--warn);font-weight:600">'+state+'</span>':'')+'</span>'+
+      '<span style="text-align:right"><span class="amt num" style="display:block;font-size:17px">'+eur(v)+'</span>'+(g!=null?'<span class="small num" style="display:block;color:'+(g>=0?'var(--pos)':'var(--neg)')+';font-weight:600">'+(g>=0?'+':'−')+eurR(Math.abs(g))+'</span>':'')+'</span></button>'+
+      '<button class="btn sm'+(l.paused||full?' ghost':'')+'" data-act="addSavingTo" data-id="'+esc(l.id)+'" aria-label="Verser sur '+esc(l.name)+'"'+(l.paused||full?' style="opacity:.45"':'')+'>＋</button></div>'+
+      (l.ceiling>0?'<div style="margin:10px 0 0 48px">'+bar(b/l.ceiling,full?'#FF9500':l.color)+'<div class="env-f"><span>'+Math.min(100,Math.round(b/l.ceiling*100))+' % du plafond</span><span>'+(full?'plein':eurR(room)+' de marge')+'</span></div></div>':'')+'</div>';
+  }).join('')+'<button class="rowadd" data-act="addLivret">＋ Ajouter un compte (livret, PEA…)</button></div>'+
+    '<p class="help">Touche un compte pour corriger son solde, son plafond ou arrêter d\'y verser.</p></section>';
 
   h+='<section class="sec"><div class="sec-h"><h2>Mes objectifs</h2><button class="link" data-act="newGoal">Ajouter</button></div>';
   if(S.goals.length){
-    h+='<div class="ringgrid">'+S.goals.map(g=>{
-      const gp=goalProgress(g);
-      return '<button class="tile" data-act="editGoal" data-id="'+esc(g.id)+'"><div class="ring">'+ringSvg(gp.pct,g.color,false,68,7)+'<span class="em">'+esc(g.icon)+'</span></div><b>'+esc(g.name)+'</b><span class="s">'+Math.round(gp.pct*100)+' %</span><span class="s2">'+(gp.done?'atteint':'sur '+eurR(g.target))+'</span></button>';
-    }).join('')+'</div>'+
-    (S.goals.some(g=>g.date)?'<div class="list" style="margin-top:12px">'+S.goals.filter(g=>g.date).map(g=>{const gp=goalProgress(g);return '<div class="row nobadge"><div class="grow"><div class="t">'+esc(g.icon+' '+g.name)+'</div><div class="s">'+(gp.done?'Objectif atteint':(gp.daysLeft<0?'Échéance dépassée':'Encore '+Math.max(0,gp.daysLeft)+' jours · à mettre de côté : ≈ '+eurR(gp.perCycle)+' par cycle'))+'</div></div></div>';}).join('')+'</div>':'');
+    h+='<div class="ringgrid">'+S.goals.map(g=>{const gp=goalProgress(g);return '<button class="tile" data-act="editGoal" data-id="'+esc(g.id)+'"><div class="ring">'+ringSvg(gp.pct,g.color,false,68,7)+'<span class="em">'+esc(g.icon)+'</span></div><b>'+esc(g.name)+'</b><span class="s">'+Math.round(gp.pct*100)+' %</span><span class="s2">'+(gp.done?'atteint':'sur '+eurR(g.target))+'</span></button>';}).join('')+'</div>'+
+      (S.goals.some(g=>g.date)?'<div class="list" style="margin-top:12px">'+S.goals.filter(g=>g.date).map(g=>{const gp=goalProgress(g);return '<div class="row nobadge"><div class="grow"><div class="t">'+esc(g.icon+' '+g.name)+'</div><div class="s" style="white-space:normal">'+(gp.done?'Objectif atteint':(gp.daysLeft<0?'Échéance dépassée':'Encore '+Math.max(0,gp.daysLeft)+' jours · à mettre de côté : ≈ '+eurR(gp.perCycle)+' par cycle'))+'</div></div></div>';}).join('')+'</div>':'');
   }else h+='<div class="panel pad muted">Un voyage, un permis, un apport… Fixe un objectif et suis-le avec un anneau.</div>';
   h+='</section>';
-
-  if(series.length){
-    h+='<section class="sec"><div class="sec-h"><h2>Épargné par cycle</h2></div><div class="panel pad">'+savingsChart(series)+'<div class="small muted" style="margin-top:6px">Virements − retraits, plus la part épargnée de tes rentrées d\'argent.</div></div></section>';
-  }
+  if(series.length)h+='<section class="sec"><div class="sec-h"><h2>Épargné par cycle</h2></div><div class="panel pad">'+savingsChart(series)+'</div></section>';
   if(arch.length)h+='<section class="sec"><div class="sec-h"><h2>Archivés</h2></div><div class="list">'+arch.map(l=>'<button class="row nobadge" data-act="editLivret" data-id="'+esc(l.id)+'"><div class="grow"><div class="t">'+esc(l.name)+'</div><div class="s">non compté dans le total</div></div><div class="amt">'+eur(bal[l.id]||0)+'</div></button>').join('')+'</div></section>';
   return h;
 }
@@ -1694,7 +1711,7 @@ function drawAdd(focus){
       '<div class="lbl2">Part à mettre de côté : <b id="shareLbl">'+Math.round(d.sharePct)+' %</b></div><div class="chips" style="margin-top:8px"><button class="chip" data-act="opShare" data-id="0">Rien</button><button class="chip" data-act="opShare" data-id="50">50 %</button><button class="chip" data-act="opShare" data-id="100">Tout</button></div>'+
       '<input type="range" id="f_tos" data-act="opTos" min="0" max="100" step="5" value="'+Math.round(d.sharePct)+'" aria-label="Part épargnée en pourcentage" style="margin-top:6px">'+
       '<p class="help" id="revSum" style="margin-top:0">'+esc(revenuSummary())+'</p>'+
-      '<div class="row nobadge" style="padding:6px 0"><div class="grow"><div class="t">Ajouter le reste à mes enveloppes</div><div class="s" style="white-space:normal">Sinon il reste « non affecté » dans Budget</div></div>'+switchHtml(d.distribute!==false,'id="f_dist"')+'</div>'+
+      '<div class="row nobadge" style="padding:6px 0"><div class="grow"><div class="t">Ajouter le reste à mes enveloppes</div><div class="s" style="white-space:normal">Sinon il reste « à répartir » dans Budget</div></div>'+switchHtml(d.distribute!==false,'id="f_dist"')+'</div>'+
       '<div class="field"><label for="f_liv">Livret qui reçoit la part épargnée</label><select id="f_liv">'+S.livrets.filter(l=>l.active||l.id===d.livretId).map(l=>'<option value="'+esc(l.id)+'"'+(l.id===d.livretId?' selected':'')+'>'+esc(l.name)+'</option>').join('')+'</select></div>';
   }else{
     const ls=S.livrets.filter(l=>l.active||l.id===d.livretId);
@@ -1899,7 +1916,7 @@ function openBilan(){
   if(b.skipped&&b.skipped.length)h+='<div class="callout"><b>Non alimentés</b>'+b.skipped.map(x=>esc(x.name)+' : '+esc(x.why)).join('<br>')+'</div>';
   if(b.kept>=5)h+='<p class="help">'+eurR(b.kept)+' ne peuvent pas être placés (plafonds atteints ou livrets en pause) : ils restent sur ton compte.</p>';
   if(b.gap>0)h+='<p class="help">Ton matelas de sécurité vise 3 mois de dépenses ('+eurR(b.cu.min)+') : il te manque '+eurR(b.gap)+'.</p>';
-  else if(!b.hasStrategy)h+='<p class="help">Écris ta stratégie dans Bourse › Ma stratégie : la proposition répartira alors vers ton PEA, ton assurance-vie… selon tes choix.</p>';
+  else if(!b.hasPlan)h+='<p class="help">Règle « Ma répartition » dans l\'onglet Épargne : la proposition suivra alors tes choix (livrets, PEA…).</p>';
   h+='<p class="help">Ces virements sont à faire sur ta banque : l\'appli les enregistre pour suivre ton épargne.</p>'+
     '<div class="sheet-actions"><button class="btn ghost" data-act="closeSheet">Plus tard</button>'+(b.lines.length?'<button class="btn" id="bl_apply">Enregistrer ces virements</button>':'')+'</div>';
   openSheet(h,{key:'bilan',tall:true});
@@ -1955,7 +1972,7 @@ function openEditSavings(){
     '<div class="lbl2" style="margin-top:14px">Montant prévu (€)</div><div class="field" style="margin-top:6px"><input id="f_bud" class="amount" inputmode="decimal" value="'+esc(fnum(c.savings))+'" aria-label="Épargne prévue en euros"></div>'+
     '<div class="chips" style="justify-content:center"><button class="chip" data-act="bump" data-id="-50">−50</button><button class="chip" data-act="bump" data-id="-10">−10</button><button class="chip" data-act="bump" data-id="10">+10</button><button class="chip" data-act="bump" data-id="50">+50</button></div>'+
     '<div style="margin-top:14px"><div class="kv"><span>Déjà mis de côté</span><b>'+eur(saved)+'</b></div>'+(st.income>0?'<div class="kv"><span>Part de tes revenus</span><b>'+fmtPct(c.savings/st.income*100)+'</b></div>':'')+'</div>'+
-    '<p class="help">Si tu changes ce montant, l\'argent libéré (ou manquant) apparaît en « non affecté » : touche « Répartir le reste » pour le mettre dans tes enveloppes.</p>'+
+    '<p class="help">Si tu changes ce montant, l\'argent libéré (ou manquant) apparaît « à répartir » : touche « Répartir le reste » pour le mettre dans tes enveloppes.</p>'+
     '<div class="sheet-actions"><button class="btn ghost" data-act="closeSheet">Annuler</button><button class="btn" id="eb_save">Enregistrer</button></div>',{key:'editsavings',focus:'#f_bud'});
   $('#eb_save').onclick=async()=>{
     const v=parseNum(val('f_bud'));
@@ -2043,7 +2060,7 @@ async function saveRec(){
   if(r)closeSheet();
 }
 
-/* ---------- Livrets ---------- */
+/* ---------- Comptes d'épargne (livrets, PEA…) ---------- */
 let livDraft=null;
 const KIND_HINT={
   livret_a:'Taux fixé par l\'État : 1,7 % depuis le 1er août 2026, révisé tous les 6 mois. Plafond 22 950 €.',
@@ -2051,10 +2068,10 @@ const KIND_HINT={
   lep:'Réservé aux revenus modestes. Taux 2,5 % au 1er août 2026. Plafond 10 000 €.',
   pel:'Le taux est fixé à l\'ouverture du plan (2 % brut pour les PEL ouverts en 2026). Plafond 61 200 €.',
   livret_jeune:'Taux librement fixé par la banque, au moins égal à celui du Livret A. Plafond 1 600 €.',
-  pea:'Laisse le taux vide : en bourse, le rendement n\'est pas garanti. Plafond de versements 150 000 €.',
+  pea:'Compte de bourse : le rendement n\'est pas garanti. Plafond de versements 150 000 €.',
   pea_jeune:'18-25 ans rattaché au foyer fiscal de tes parents. Plafond de versements 20 000 €.',
   pea_pme:'Plafond cumulé PEA + PEA-PME : 225 000 €.',
-  assurance_vie:'Le rendement dépend des supports choisis. Laisse le taux vide si tu n\'es pas sûr.',
+  assurance_vie:'Le rendement dépend des supports choisis (fonds en euros, unités de compte).',
   cto:'Pas de plafond. Gains imposés à la flat tax (31,4 % en 2026).',
   per:'Épargne retraite, bloquée jusqu\'à la retraite sauf cas particuliers.',
   livret_banque:'Taux librement fixé par ta banque.',
@@ -2062,45 +2079,60 @@ const KIND_HINT={
 };
 function openLivretEdit(id,kind){
   const l=id?livretById(id):null;
-  if(l)livDraft=Object.assign({},l,{rate:l.rate||'',ceiling:l.ceiling||'',startBalance:String(l.startBalance)});
-  else{
+  if(l){
+    const bal=livretBalances()[l.id]||0;
+    livDraft=Object.assign({},l,{rate:l.rate||'',ceiling:l.ceiling||'',balance:fnum(r2(bal)),opsNet:r2(bal-l.startBalance),value:l.marketValue!=null?fnum(livretValue(l)):'',support:l.support||''});
+  }else{
     const order=['livret_a','ldds','lep','pel','pea','assurance_vie'];
     const have=S.livrets.filter(x=>x.active).map(x=>x.kind);
     const k=kind||order.find(o=>have.indexOf(o)<0)||'autre',kd=KINDS[k];
-    livDraft={id:'',name:kd.label,kind:k,rate:kd.rate||'',ceiling:kd.ceiling||'',startBalance:'',color:kd.color,active:true,paused:false};
+    livDraft={id:'',name:kd.label,kind:k,rate:kd.rate||'',ceiling:kd.ceiling||'',balance:'',opsNet:0,value:'',support:'',color:kd.color,active:true,paused:false};
   }
   drawLivret();
 }
 function readLiv(){
-  const n=$('#f_lname');if(n)livDraft.name=n.value;
-  const r=$('#f_lrate');if(r)livDraft.rate=r.value;
-  const c=$('#f_lceil');if(c)livDraft.ceiling=c.value;
-  const b=$('#f_lbal');if(b)livDraft.startBalance=b.value;
+  const g=id=>{const e=$('#'+id);return e?e.value:null;};
+  const n=g('f_lname');if(n!=null)livDraft.name=n;
+  const r=g('f_lrate');if(r!=null)livDraft.rate=r;
+  const c=g('f_lceil');if(c!=null)livDraft.ceiling=c;
+  const b=g('f_lbal');if(b!=null)livDraft.balance=b;
+  const v=g('f_lval');if(v!=null)livDraft.value=v;
+  const sp=g('f_lsup');if(sp!=null)livDraft.support=sp;
   const p=$('#f_paused');if(p)livDraft.paused=p.checked;
 }
 function drawLivret(){
-  const d=livDraft,isNew=!d.id;
-  openSheet('<h3>'+(isNew?'Ajouter un livret':'Modifier le livret')+'</h3>'+
+  const d=livDraft,isNew=!d.id,inv=!(KINDS[d.kind]||KINDS.autre).safe;
+  openSheet('<h3>'+(isNew?'Ajouter un compte':esc(d.name))+'</h3>'+
     '<div class="field"><label for="f_lkind">Type</label><select id="f_lkind" data-act="livKind">'+Object.keys(KINDS).map(k=>'<option value="'+k+'"'+(d.kind===k?' selected':'')+'>'+esc(KINDS[k].label)+'</option>').join('')+'</select></div>'+
     '<div class="field"><label for="f_lname">Nom</label><input id="f_lname" maxlength="40" value="'+esc(d.name)+'"></div>'+
-    '<div class="field"><label for="f_lbal">'+(isNew?'Solde actuel (€)':'Solde de départ (€)')+'</label><input id="f_lbal" inputmode="decimal" value="'+esc(fnum(d.startBalance))+'" placeholder="0"></div>'+
-    '<p class="help" style="margin-top:-6px">'+(isNew?'Ce que tu as déjà dessus aujourd\'hui. Tes virements futurs s\'ajoutent à ce montant.':'Le solde affiché = ce montant + tes virements, intérêts et retraits enregistrés.')+'</p>'+
-    '<div class="two"><div class="field"><label for="f_lrate">Taux (% par an)</label><input id="f_lrate" inputmode="decimal" value="'+esc(fnum(d.rate))+'" placeholder="optionnel"></div>'+
-    '<div class="field"><label for="f_lceil">Plafond (€)</label><input id="f_lceil" inputmode="decimal" value="'+esc(fnum(d.ceiling))+'" placeholder="aucun"></div></div>'+
+    '<div class="field"><label for="f_lbal">'+(inv?'Total versé aujourd\'hui (€)':'Solde actuel (€)')+'</label><input id="f_lbal" inputmode="decimal" value="'+esc(d.balance)+'" placeholder="0"></div>'+
+    '<p class="help" style="margin-top:-6px">'+(inv?'L\'argent que tu as mis dessus au total. Tes prochains versements s\'ajouteront tout seuls.':'Ce qu\'il y a dessus aujourd\'hui. Tes prochains virements s\'ajouteront tout seuls.')+'</p>'+
+    (inv?'<div class="field"><label for="f_lval">Valeur actuelle (€, facultatif)</label><input id="f_lval" inputmode="decimal" value="'+esc(d.value)+'" placeholder="ce que vaut le compte aujourd\'hui"></div>'+
+      '<div class="field"><label for="f_lsup">Ce que tu achètes dessus (facultatif)</label><input id="f_lsup" maxlength="40" value="'+esc(d.support)+'" placeholder="Ex. ETF Monde"></div>':
+      '<div class="two"><div class="field"><label for="f_lrate">Taux (% par an)</label><input id="f_lrate" inputmode="decimal" value="'+esc(fnum(d.rate))+'" placeholder="optionnel"></div><div class="field"><label for="f_lceil">Plafond (€)</label><input id="f_lceil" inputmode="decimal" value="'+esc(fnum(d.ceiling))+'" placeholder="aucun"></div></div>')+
+    (inv?'<div class="field"><label for="f_lceil">Plafond de versements (€)</label><input id="f_lceil" inputmode="decimal" value="'+esc(fnum(d.ceiling))+'" placeholder="aucun"></div>':'')+
     (KIND_HINT[d.kind]?'<p class="help" style="margin-top:0">'+esc(KIND_HINT[d.kind])+'</p>':'')+
-    '<div class="row nobadge" style="padding:8px 4px;margin-top:6px"><div class="grow"><div class="t">Ne plus y verser</div><div class="s" style="white-space:normal">L\'appli ne te proposera plus de mettre d\'argent dessus (bilan, stratégie).</div></div>'+switchHtml(!!d.paused,'id="f_paused"')+'</div>'+
+    '<div class="row nobadge" style="padding:8px 4px;margin-top:6px"><div class="grow"><div class="t">Ne plus y verser</div><div class="s" style="white-space:normal">L\'appli ne te proposera plus d\'y mettre de l\'argent. Le solde reste compté.</div></div>'+switchHtml(!!d.paused,'id="f_paused"')+'</div>'+
     '<div class="lbl2" style="margin-top:14px">Couleur</div><div class="swatches" style="margin-top:8px">'+PALETTE.map(c=>'<button class="sw" data-act="livColor" data-id="'+c+'" style="background:'+c+'" aria-pressed="'+(d.color===c)+'" aria-label="Couleur"></button>').join('')+'</div>'+
-    '<div class="sheet-actions">'+(isNew?'<button class="btn ghost" data-act="closeSheet">Annuler</button>':'<button class="btn danger fit" data-act="livDelete">Supprimer</button><button class="btn ghost fit" data-act="livArchive">'+(d.active?'Archiver':'Restaurer')+'</button>')+'<button class="btn" data-act="livSave">Enregistrer</button></div>'+
+    '<div class="sheet-actions">'+(isNew?'<button class="btn ghost" data-act="closeSheet">Annuler</button>':'<button class="btn danger fit" data-act="livDelete">Supprimer</button>'+(d.active?'':'<button class="btn ghost fit" data-act="livArchive">Restaurer</button>'))+'<button class="btn" data-act="livSave">Enregistrer</button></div>'+
     (isNew?'':'<div style="text-align:center;margin-top:14px"><button class="link" data-act="addInterest" data-id="'+esc(d.id)+'">Enregistrer des intérêts reçus</button></div>'),{key:'livedit',focus:isNew?'#f_lname':null});
 }
 async function saveLiv(){
   readLiv();
-  const d=livDraft;
-  if(!d.name.trim()){toast('Donne un nom au livret.',true);return;}
-  const bal=d.startBalance===''?0:parseNum(d.startBalance);
-  if(!isFinite(bal)){toast('Solde invalide.',true);return;}
-  const r=await act('saveLivret',{id:d.id||undefined,name:d.name,kind:d.kind,rate:d.rate===''?'':parseNum(d.rate),ceiling:d.ceiling===''?'':parseNum(d.ceiling),startBalance:bal,color:d.color,active:d.active,paused:!!d.paused},'Livret enregistré',true);
-  if(r)closeSheet();
+  const d=livDraft,inv=!(KINDS[d.kind]||KINDS.autre).safe;
+  if(!d.name.trim()){toast('Donne un nom au compte.',true);return;}
+  const entered=d.balance===''?0:parseNum(d.balance);
+  if(!isFinite(entered)){toast('Solde invalide.',true);return;}
+  const startBalance=r2(entered-(d.id?d.opsNet:0));
+  const r=await act('saveLivret',{id:d.id||undefined,name:d.name,kind:d.kind,rate:inv?'':(d.rate===''?'':parseNum(d.rate)),ceiling:d.ceiling===''?'':parseNum(d.ceiling),startBalance,color:d.color,active:d.active,paused:!!d.paused,support:inv?d.support:''},'Compte enregistré',true);
+  if(!r)return;
+  const id=d.id||(r.result&&r.result.id);
+  if(inv&&id){
+    const l=livretById(id),v=d.value.trim();
+    if(v!==''){const nv=parseNum(v);if(isFinite(nv)&&(!l||l.marketValue==null||Math.abs(livretValue(l)-nv)>=0.01))await act('setLivretValues',{date:S.today,values:{[id]:nv}});}
+    else if(l&&l.marketValue!=null)await act('setLivretValues',{date:S.today,values:{[id]:''}});
+  }
+  closeSheet();
 }
 
 /* ---------- Objectifs d'épargne ---------- */
@@ -2183,9 +2215,9 @@ function downloadBackup(){
 function supportSuggestions(livretId){
   const l=livretById(livretId);if(!l)return [];
   const out=[];
-  (strategyState().rows||[]).filter(r=>r.kind===l.kind&&r.label).forEach(r=>{if(out.indexOf(r.label)<0)out.push(r.label);});
+  if(l.support)out.push(l.support);
   S.operations.filter(o=>o.type==='epargne'&&o.livretId===livretId&&o.support).forEach(o=>{if(out.indexOf(o.support)<0)out.push(o.support);});
-  if(!out.length&&!(KINDS[l.kind]||KINDS.autre).safe)['ETF Monde','Fonds en euros','Actions'].forEach(x=>out.push(x));
+  if(!(KINDS[l.kind]||KINDS.autre).safe)['ETF Monde','Fonds en euros','Actions'].forEach(x=>{if(out.indexOf(x)<0)out.push(x);});
   return out.slice(0,6);
 }
 
@@ -2193,50 +2225,34 @@ function supportSuggestions(livretId){
    9. ASSISTANT DE DÉMARRAGE (4 étapes)
    ===================================================================== */
 UI.setupAmt={};UI.setupW={};UI.setupBal={};
-function setupStepNow(){
-  if(!S.cycles.length)return 1;
-  return Math.max(2,UI.setupStep||2);
-}
+function setupStepNow(){return S.cycles.length?2:1;}
 function renderSetup(){
   $('#tabbar').hidden=true;$('#fab').hidden=true;
   const step=setupStepNow();
-  $('#top').innerHTML='<div><h1>Bienvenue</h1><div class="sub">Étape '+step+' sur 4</div></div>';
+  $('#top').innerHTML='<div><h1>Bienvenue</h1><div class="sub">Étape '+step+' sur 2</div></div>';
   let h='';
   if(step===1){
-    if(!incDraft)incDraft=S.incomeSources.map((s,i)=>({id:s.id,name:s.name,icon:s.icon,amount:s.amount?fnum(s.amount):'',on:true}));
+    if(!incDraft)incDraft=S.incomeSources.map(s=>({id:s.id,name:s.name,icon:s.icon,amount:s.amount?fnum(s.amount):'',on:true}));
     const d=UI.setupCy=UI.setupCy||{date:S.today,profileId:(S.profiles[0]||{}).id};
-    h='<section class="sec" style="margin-top:6px"><p class="muted" style="margin:0 4px 14px">Ton budget part de ce que tu reçois. Ton cycle commence le jour où tu es payé, et ça peut changer d\'un mois à l\'autre : tu appuieras sur « J\'ai été payé » à chaque paie.</p>'+
+    h='<section class="sec" style="margin-top:6px"><p class="muted" style="margin:0 4px 14px">Ton budget part de ce que tu reçois. Indique ta dernière paie : à chaque nouvelle paie, tu toucheras « J\'ai été payé » et tout sera pré-rempli.</p>'+
       '<div class="sec-h"><h2>Tes revenus</h2></div>'+incomesBlock({switches:false})+
       '<div class="field"><label for="s_date">Date de ta dernière paie</label><input id="s_date" type="date" value="'+esc(d.date)+'"></div>'+
-      '<div class="lbl2">Profil de départ</div>'+chipsHtml(S.profiles.map(p=>({id:p.id,label:esc(p.icon)+' '+esc(p.name)+' · '+fnum(p.rate)+' %'})),d.profileId,'setupProfile')+
-      '<p class="help">Les aides de l\'État (APL…), une bourse, un loyer perçu : ajoute-les ici avec leurs montants. Les rentrées exceptionnelles (cadeau d\'anniversaire…) s\'ajoutent plus tard avec le bouton +.</p>'+
-      '<div style="margin-top:22px"><button class="btn block" data-act="setupStep1">Continuer</button></div></section>';
-  }else if(step===2){
-    const c=currentCycle();
-    h='<section class="sec" style="margin-top:6px"><p class="muted" style="margin:0 4px 14px">Les prélèvements sont comptés automatiquement chaque cycle : tu n\'as rien à saisir. Ajoute ceux que tu connais, tu pourras en ajouter d\'autres plus tard.</p>'+
-      '<div class="sec-h"><h2>Prélèvements automatiques</h2><span class="cap num">'+eurR(sum(c?c.fixed||[]:[],f=>f.amount))+'</span></div><div class="list">'+
-      ((c&&c.fixed||[]).map(f=>'<button class="row" data-act="editRec" data-id="'+esc(f.id)+'"><span class="badge" style="background:var(--surface2)">'+esc(f.icon)+'</span><div class="grow"><div class="t">'+esc(f.name)+'</div></div><div class="amt">'+eur(f.amount)+'</div><span class="chev">›</span></button>').join(''))+
-      '<button class="rowadd" data-act="newRec">＋ Ajouter un prélèvement</button></div>'+
-      '<div class="chips" style="margin-top:12px">'+DEBIT_PRESETS.map(p=>'<button class="chip" data-act="recPresetNew" data-id="'+esc(p[0])+'|'+esc(p[1])+'">'+esc(p[1])+' '+esc(p[0])+'</button>').join('')+'</div>'+
-      '<div style="margin-top:22px"><button class="btn block" data-act="setupStep2">Continuer</button></div></section>';
-  }else if(step===3){
-    const c=currentCycle();
-    h='<section class="sec" style="margin-top:6px"><p class="muted" style="margin:0 4px 14px">Voici comment ta paie est répartie. Tout est en euros et tu peux tout modifier : rien ne sera recalculé sans que tu le demandes.</p>'+
-      '<div class="panel pad"><div id="setupSummary">'+setupSummaryHtml()+'</div></div>'+
-      '<div class="sec-h" style="margin-top:22px"><h2>Épargne et enveloppes</h2></div><div class="list">'+
-      '<div class="row"><span class="badge" style="background:rgba(52,199,89,.16)">🌱</span><div class="grow"><div class="t">Épargne</div><div class="s">mise de côté ce cycle</div></div><input data-act="setupSav" inputmode="decimal" value="'+esc(setupVals().savStr)+'" aria-label="Épargne en euros" style="width:100px;text-align:right"></div>'+
-      S.categories.map(k=>'<div class="row">'+badge(k)+'<div class="grow"><div class="t">'+esc(k.name)+'</div><div class="s">'+(k.type==='fixe'?'montant fixe':'variable')+'</div></div><input data-act="setupAmt" data-id="'+esc(k.id)+'" inputmode="decimal" value="'+esc(setupVals().strs[k.id])+'" aria-label="Montant '+esc(k.name)+'" style="width:100px;text-align:right"></div>').join('')+
-      '<button class="rowadd" data-act="newCat">＋ Ajouter une enveloppe</button></div>'+
-      '<p class="help">Les enveloppes « variables » (essence, fun…) pourront s\'adapter à chaque nouveau cycle ; les « fixes » gardent leur montant.</p>'+
-      '<div style="margin-top:22px;display:flex;gap:10px"><button class="btn ghost" data-act="setupBack">Retour</button><button class="btn" style="flex:1" data-act="setupStep3">Continuer</button></div></section>';
+      '<p class="help">Aides (APL…), bourse, loyer perçu : ajoute-les avec les boutons ci-dessus. Les rentrées exceptionnelles (cadeau…) s\'ajouteront plus tard avec le bouton +.</p>'+
+      '<div style="margin-top:22px"><button class="btn block" data-act="setupStep1">Continuer</button></div>'+
+      '<div style="text-align:center;margin-top:16px"><button class="link" data-act="restore">J\'ai déjà une sauvegarde : la restaurer</button></div></section>';
   }else{
-    h='<section class="sec" style="margin-top:6px"><p class="muted" style="margin:0 4px 14px">Indique ce que tu as déjà de côté. Touche un livret pour le modifier, changer son plafond ou le supprimer.</p><div class="list">'+
-      S.livrets.filter(l=>l.active).map(l=>{
-        const v=UI.setupBal[l.id]!=null?UI.setupBal[l.id]:(l.startBalance?fnum(l.startBalance):'');
-        return '<div class="row"><button style="display:flex;align-items:center;gap:12px;flex:1;min-width:0;text-align:left;background:none;border:0;padding:0" data-act="editLivret" data-id="'+esc(l.id)+'" aria-label="Modifier '+esc(l.name)+'"><span class="badge" style="background:'+l.color+'26;color:'+l.color+';font-weight:700;font-size:13px">'+esc((KINDS[l.kind]||KINDS.autre).label.slice(0,2))+'</span><div class="grow"><div class="t">'+esc(l.name)+'</div><div class="s">'+esc((KINDS[l.kind]||KINDS.autre).label)+(l.paused?' · ⏸ versements en pause':'')+' · modifier ›</div></div></button>'+
-          '<input data-act="setupBal" data-id="'+esc(l.id)+'" inputmode="decimal" placeholder="0" value="'+esc(v)+'" aria-label="Solde '+esc(l.name)+'" style="width:110px;text-align:right"></div>';
-      }).join('')+'<button class="rowadd" data-act="addLivret">＋ Ajouter un livret</button></div>'+
-      '<div style="margin-top:22px;display:flex;gap:10px"><button class="btn ghost" data-act="setupBack">Retour</button><button class="btn" style="flex:1" data-act="setupFinish">Terminer</button></div></section>';
+    const c=currentCycle();
+    h='<section class="sec" style="margin-top:6px"><p class="muted" style="margin:0 4px 14px">Voici ton budget, calculé depuis tes revenus. Tout est en euros : change ce que tu veux, rien ne bougera sans toi.</p>'+
+      '<div class="panel pad"><div id="setupSummary">'+setupSummaryHtml()+'</div></div>'+
+      '<div class="sec-h" style="margin-top:22px"><h2>Prélèvements automatiques</h2><span class="cap num">'+eurR(sum(c?c.fixed||[]:[],f=>f.amount))+'</span></div><div class="list">'+
+      ((c&&c.fixed||[]).map(f=>'<button class="row" data-act="editRec" data-id="'+esc(f.id)+'"><span class="badge" style="background:var(--surface2)">'+esc(f.icon)+'</span><div class="grow"><div class="t">'+esc(f.name)+'</div></div><div class="amt">'+eur(f.amount)+'</div><span class="chev">›</span></button>').join(''))+
+      '<button class="rowadd" data-act="newRec">＋ Loyer, téléphone, abonnement…</button></div>'+
+      '<div class="sec-h" style="margin-top:22px"><h2>Épargne et enveloppes</h2></div><div class="list">'+
+      '<div class="row"><span class="badge" style="background:rgba(52,199,89,.16)">🌱</span><div class="grow"><div class="t">Épargne</div><div class="s">mise de côté chaque cycle</div></div><input data-act="setupSav" inputmode="decimal" value="'+esc(setupVals().savStr)+'" aria-label="Épargne en euros" style="width:100px;text-align:right"></div>'+
+      S.categories.map(k=>'<div class="row">'+badge(k)+'<div class="grow"><div class="t">'+esc(k.name)+'</div><div class="s">'+(k.type==='fixe'?'montant fixe':'s\'adapte à ta paie')+'</div></div><input data-act="setupAmt" data-id="'+esc(k.id)+'" inputmode="decimal" value="'+esc(setupVals().strs[k.id])+'" aria-label="Montant '+esc(k.name)+'" style="width:100px;text-align:right"></div>').join('')+
+      '<button class="rowadd" data-act="newCat">＋ Ajouter une enveloppe</button></div>'+
+      '<p class="help">Tes livrets et ton épargne déjà constituée s\'ajoutent ensuite dans l\'onglet Épargne.</p>'+
+      '<div style="margin-top:22px"><button class="btn block" data-act="setupFinish">C\'est parti</button></div></section>';
   }
   $('#view').innerHTML=h;
 }
@@ -2261,7 +2277,7 @@ function setupSummaryHtml(){
   return '<div class="small muted">Revenus du cycle</div><div style="font:700 28px var(--font);letter-spacing:-.03em" class="num">'+eurR(income)+'</div>'+
     '<div style="margin-top:12px">'+donutBar(items.map(i=>({color:i.color,v:Math.max(0,i.v)})))+'</div>'+
     '<div class="leg">'+items.map(i=>'<div><i style="background:'+i.color+'"></i><span>'+i.label+'</span><b class="num">'+eurR(i.v)+'</b></div>').join('')+'</div>'+
-    (left>0.5?'<div class="callout tip" style="margin:14px 0 0"><b>Il reste '+eurR(left)+' à affecter</b>Cet argent n\'est encore dans aucune enveloppe.<div style="margin-top:10px"><button class="btn sm" data-act="setupDistribute">Répartir le reste</button></div></div>'
+    (left>0.5?'<div class="callout tip" style="margin:14px 0 0"><b>'+eurR(left)+' à répartir</b>Cet argent n\'est encore dans aucune enveloppe.<div style="margin-top:10px"><button class="btn sm" data-act="setupDistribute">Répartir le reste</button></div></div>'
       :(left<-0.5?'<div class="callout warn" style="margin:14px 0 0"><b>Tu prévois '+eurR(-left)+' de plus que tes revenus</b>Baisse un montant, ou laisse l\'appli ajuster.<div style="margin-top:10px"><button class="btn sm" data-act="setupDistribute">Ajuster automatiquement</button></div></div>'
       :'<p class="help" style="margin:12px 0 0">✓ Tout ton argent a un rôle.</p>'));
 }
@@ -2287,7 +2303,7 @@ async function setupStep1(){
   const d=UI.setupCy;d.date=val('s_date')||d.date;
   if(incTotal()<=0){toast('Indique au moins un revenu (ton salaire…).',true);return;}
   const r=await act('startCycle',{date:d.date,profileId:d.profileId,sources:incDraft.map(x=>({id:x.id,name:x.name,icon:x.icon,amount:parseNum(x.amount)||0,on:true}))});
-  if(r){UI.setupStep=2;render();}
+  if(r)await setupStep2();
 }
 async function setupStep2(){
   const c=currentCycle();
@@ -2299,7 +2315,7 @@ async function setupStep2(){
     if(inc>0&&si&&si.amount===40)await act('saveCategory',{id:si.id,name:si.name,icon:si.icon,type:'fixe',amount:Math.max(10,r5(inc*0.04)),color:si.color});
   }
   if(c&&!UI.setupCalc){UI.setupCalc=true;await act('recalcCycle',{id:c.id});}
-  UI.setupStep=3;render();
+  UI.setupStep=2;render();
 }
 async function setupStep3(){
   const v=setupVals();
@@ -2308,21 +2324,16 @@ async function setupStep3(){
   if(r){UI.setupAmt={};UI.setupSav=null;UI.setupStep=4;render();}
 }
 async function setupFinish(){
+  const v=setupVals();if(!v.c)return;
   busy(true);
   try{
-    for(const l of S.livrets.filter(x=>x.active)){
-      const raw=UI.setupBal[l.id];
-      if(raw==null)continue;
-      const v=raw===''?0:parseNum(raw);
-      if(!isFinite(v))throw new Error('Solde invalide pour '+l.name+'.');
-      if(v!==l.startBalance){const r=await call('saveLivret',{id:l.id,name:l.name,kind:l.kind,rate:l.rate,ceiling:l.ceiling,startBalance:v,color:l.color,active:l.active});S=r.state;}
-    }
-    const r2_=await call('saveSettings',{values:{setupDone:'true'}});S=r2_.state;
-    UI.setupBal={};UI.tab='home';UI.animated=false;
+    let r=await call('setBudgets',{cycleId:v.c.id,budgets:v.amts,savings:v.sav});S=r.state;
+    r=await call('saveSettings',{values:{setupDone:'true'}});S=r.state;
+    UI.setupAmt={};UI.setupSav=null;UI.tab='home';UI.animated=false;
     render();
     toast('Tout est prêt. Touche + pour ajouter une dépense.');
     if(S.settings.tourDone!=='1')setTimeout(()=>{if(typeof openTour==='function')openTour(0);},500);
-  }catch(e){toast(e.message,true);}
+  }catch(err){toast(err.message,true);}
   finally{busy(false);}
 }
 
@@ -2401,7 +2412,7 @@ const ACT={
     else{drawAdd(false);toast('Saisis d\'abord le montant.',true);setTimeout(()=>{const f=$('#f_amount');if(f)f.focus();},50);}
   },
   opLiv(el){
-    readAdd();opDraft.livretId=el.dataset.id;
+    readAdd();opDraft.livretId=el.dataset.id;{const lv0=livretById(el.dataset.id);if(lv0&&lv0.support&&!opDraft.support)opDraft.support=lv0.support;}
     if(opDraft.id){drawAdd(false);return;}
     const a=parseNum(opDraft.amount),lv=livretById(opDraft.livretId);
     const needsSupport=opDraft.type==='epargne'&&lv&&!(KINDS[lv.kind]||KINDS.autre).safe;
@@ -2639,6 +2650,95 @@ async function importCsvRows(){
   if(r){await call('saveSettings',{values:{catRules:JSON.stringify(rules)}}).then(x=>{S=x.state;});closeSheet();render();}
 }
 
+document.addEventListener('toggle',ev=>{if(ev.target&&ev.target.id==='budgetFold')UI.foldOpen=ev.target.open;},true);
+
+/* =====================================================================
+   ÉPARGNE : ma répartition (en % par compte) et les virements du cycle
+   ===================================================================== */
+let planDraft=null;
+const isInvest=l=>!(KINDS[l.kind]||KINDS.autre).safe;
+const abbr=l=>esc((KINDS[l.kind]||KINDS.autre).label.slice(0,2));
+function openPlanEdit(){
+  const st=strategyState();
+  planDraft={plan:Object.assign({},st.plan),cushionFirst:st.cushionFirst!==false};
+  drawPlan();
+}
+function drawPlan(){
+  const c=currentCycle(),sav=c?c.savings:0;
+  const accs=S.livrets.filter(l=>l.active);
+  const tot=sum(accs,l=>+planDraft.plan[l.id]||0);
+  const prof=strategyState().profile;
+  let h='<h3>Ma répartition</h3><p class="lead">Où va ton épargne chaque cycle. Choisis la part de chaque compte : l\'appli calcule les montants.</p>'+
+    '<div class="list" style="margin-top:12px">'+accs.map(l=>{
+      const p=+planDraft.plan[l.id]||0,blocked=l.paused||livretRoom(l)<1;
+      return '<div class="row"><span class="badge" style="background:'+l.color+'26;color:'+l.color+';font-weight:700;font-size:13px">'+abbr(l)+'</span><div class="grow"><div class="t">'+esc(l.name)+'</div><div class="s">'+(blocked?(l.paused?'⏸ en pause : sa part ira ailleurs':'plafond atteint : sa part ira ailleurs'):(tot>0&&p>0?'≈ '+eurR(sav*p/tot)+' par cycle':'rien pour l\'instant'))+'</div></div>'+
+        '<button class="chip" data-act="planStep" data-id="'+esc(l.id)+'|-10" aria-label="Moins">−</button><b class="num" style="min-width:44px;text-align:center">'+Math.round(tot>0?p/tot*100:0)+' %</b><button class="chip" data-act="planStep" data-id="'+esc(l.id)+'|10" aria-label="Plus">+</button></div>';
+    }).join('')+'</div>'+
+    (prof&&prof.key?'<div style="margin-top:12px"><button class="btn ghost block" data-act="profileApply">Remplir selon mon profil ('+esc(INVESTOR[prof.key].label)+')</button></div>':'<p class="help">Astuce : le test « Mon profil » (onglet Bourse) peut remplir cette répartition pour toi.</p>')+
+    '<div class="row nobadge" style="padding:10px 4px;margin-top:6px"><div class="grow"><div class="t">Matelas de sécurité d\'abord</div><div class="s" style="white-space:normal">Tant que tes livrets ne couvrent pas 3 mois de dépenses, l\'épargne va d\'abord sur eux.</div></div>'+switchHtml(planDraft.cushionFirst,'id="pl_cushion"')+'</div>'+
+    '<p class="help">Les plafonds et les comptes en pause sont toujours respectés : leur part est reportée sur les autres comptes.</p>'+
+    '<div class="sheet-actions"><button class="btn ghost" data-act="closeSheet">Annuler</button><button class="btn" data-act="planSave">Enregistrer</button></div>';
+  openSheet(h,{key:'plan',tall:accs.length>4});
+}
+function normalizePlan(plan){
+  const ids=Object.keys(plan).filter(id=>+plan[id]>0),tot=sum(ids,id=>+plan[id]);
+  const out={};if(!tot)return out;
+  let acc=0;ids.forEach((id,i)=>{const v=i===ids.length-1?100-acc:Math.round(plan[id]/tot*100);out[id]=v;acc+=v;});
+  return out;
+}
+async function savePlan(){
+  const sw=$('#pl_cushion');if(sw)planDraft.cushionFirst=sw.checked;
+  const st=strategyState();
+  st.plan=normalizePlan(planDraft.plan);st.cushionFirst=planDraft.cushionFirst;
+  if(!Object.keys(st.plan).length){toast('Choisis au moins un compte.',true);return;}
+  const r=await act('saveSettings',{values:{strategy:JSON.stringify(st)}},'Répartition enregistrée');
+  if(r)closeSheet();
+}
+/* le profil investisseur propose une répartition : part « bourse » sur les comptes de bourse, le reste en sécurité */
+function planFromProfile(key){
+  const share={prudent:20,equilibre:45,dynamique:70,offensif:90}[key]||45;
+  const ok=S.livrets.filter(l=>l.active&&!l.paused);
+  const inv=ok.filter(isInvest),safe=ok.filter(l=>!isInvest(l)).sort((a,b)=>(b.rate||0)-(a.rate||0));
+  const plan={};
+  if(!inv.length){if(safe[0])plan[safe[0].id]=100;return {plan,missing:share};}
+  inv.forEach(l=>plan[l.id]=share/inv.length);
+  if(safe.length)plan[safe[0].id]=100-share;else inv.forEach(l=>plan[l.id]=100/inv.length);
+  return {plan:normalizePlan(plan),missing:0};
+}
+Object.assign(ACT,{
+  planEdit(){openPlanEdit();},
+  planStep(el){
+    const p=el.dataset.id.split('|'),id=p[0],d=+p[1];
+    const sw=$('#pl_cushion');if(sw)planDraft.cushionFirst=sw.checked;
+    const accs=S.livrets.filter(l=>l.active),tot=sum(accs,l=>+planDraft.plan[l.id]||0)||0;
+    /* on travaille en % visibles : on ramène d'abord le plan à 100 */
+    const cur=tot>0?normalizePlan(planDraft.plan):{};
+    cur[id]=Math.max(0,Math.min(100,(cur[id]||0)+d));
+    planDraft.plan=cur;drawPlan();
+  },
+  planSave(){savePlan();},
+  async planDo(){
+    const c=currentCycle();if(!c)return;
+    const sp=savingsPlan(c);
+    if(!sp.todo.length){toast('Tout est déjà fait pour ce cycle.');return;}
+    await act('applyBilan',{date:S.today,lines:sp.todo.map(t=>({livretId:t.livretId,amount:t.amount,label:'Épargne du cycle',support:t.support}))},'Virements enregistrés',true);
+  },
+  async profileApply(){
+    const st=strategyState(),pf=st.profile;if(!pf||!pf.key)return;
+    const res=planFromProfile(pf.key);
+    st.plan=res.plan;
+    const r=await act('saveSettings',{values:{strategy:JSON.stringify(st)}},'Répartition mise à jour selon ton profil');
+    if(r){
+      if(res.missing)toast('Ton profil vise '+res.missing+' % en bourse : ouvre un PEA (onglet Épargne) pour l\'utiliser.',false);
+      if(UI.sheetKey==='plan')openPlanEdit();else closeSheet();
+    }
+  },
+  livArchive(){
+    const l=livretById(livDraft.id);if(!l)return;
+    act('saveLivret',{id:l.id,name:l.name,kind:l.kind,rate:l.rate,ceiling:l.ceiling,startBalance:l.startBalance,color:l.color,active:!l.active},l.active?'Compte archivé':'Compte restauré',true).then(r=>{if(r)closeSheet();});
+  }
+});
+
 /* =====================================================================
    9. MODULE BOURSE : parcours, simulateurs, glossaire, stratégie
    Chiffres vérifiés en octobre 2026 : Livret A 1,7 % et LEP 2,5 % (1er août 2026),
@@ -2746,7 +2846,7 @@ const LESSONS=[
  ]],
  ['dyn','cushion'],
  ['p',`Un point d'honnêteté : investir tout d'un coup rapporte en moyenne un peu plus que d'étaler, car les marchés montent plus souvent qu'ils ne baissent. L'investissement programmé réduit surtout le regret et colle à un revenu mensuel, ce qui est ton cas.`],
- ['call','tip','Écris-la',`Dans l'onglet « Ma stratégie », note ton objectif, ton allocation cible et tes règles. Une stratégie écrite évite de décider sous le coup de l'émotion.`]
+ ['call','tip','Écris-la',`Dans Bourse › Mon profil, fais le test et écris tes règles ; ta répartition d'épargne se règle dans Épargne. Une stratégie écrite évite de décider sous le coup de l'émotion.`]
 ],quiz:{q:`Que fait l'investissement programmé (DCA) ?`,o:[`Il garantit un gain`,`Il investit un montant régulier quel que soit le prix`,`Il place tout l'argent au meilleur moment`],a:1,why:'Un montant régulier achète plus de parts quand les prix baissent et moins quand ils montent, sans garantie de gain.'}},
 
 {id:'l7',title:'La fiscalité simplement',min:4,blocks:[
@@ -2779,7 +2879,7 @@ const LESSONS=[
   ['Ouvrir un PEA',`PEA Jeune si tu es éligible. Un petit premier versement suffit à lancer le compteur des 5 ans.`],
   ['Programmer un virement',`Le même montant à chaque cycle, comme une dépense fixe.`],
   ['Acheter un ETF large',`Diversifié, frais bas, capitalisant, éligible PEA.`],
-  ['Écrire ta stratégie',`Onglet « Ma stratégie ».`]
+  ['Écrire tes règles',`Bourse › Mon profil.`]
  ]],
  ['h','Les pièges classiques'],
  ['ul',[
@@ -2821,7 +2921,7 @@ const LESSONS=[
   ['Un montant fixe chaque cycle',`Même 30 €. L'habitude vaut plus que le montant.`],
   ['Augmenter à chaque hausse de revenu',`Chaque fois que tes revenus montent, relève ton taux d'épargne d'un point : tu ne sens presque rien.`]
  ]],
- ['call','tip','Dans l\'appli',`Dans l'onglet Budget, touche « Épargne prévue » pour régler ce que tu mets de côté. La répartition entre livrets et bourse se règle dans Bourse › Stratégie.`]
+ ['call','tip','Dans l\'appli',`Dans l'onglet Budget, touche « Épargne prévue » pour régler ce que tu mets de côté. La répartition entre livrets et bourse se règle dans Épargne › Ma répartition.`]
 ],quiz:{q:`Pourquoi regrouper ses achats quand on investit de petits montants ?`,o:[`Pour limiter le poids des frais fixes de courtage`,`Pour payer moins d'impôt`,`Parce que c'est obligatoire`],a:0,why:'Une commission fixe pèse proportionnellement plus sur un petit ordre : moins d\'ordres, plus gros, coûtent moins cher.'}},
 
 {id:'l11',title:'Les pièges du comportement',min:5,blocks:[
@@ -2836,7 +2936,7 @@ const LESSONS=[
  ]],
  ['h','Les parades'],
  ['steps',[
-  ['Écrire sa stratégie',`Onglet Bourse › Stratégie : tu décides à froid.`],
+  ['Écrire sa stratégie',`Bourse › Mon profil : tu décides à froid.`],
   ['Automatiser les versements',`Un virement programmé, comme une dépense fixe, supprime la tentation de « choisir le bon moment ».`],
   ['Regarder moins souvent',`Une fois par cycle suffit. Si tu regardes tous les jours, tu vois surtout du bruit.`],
   ['La règle des 24 heures',`Pour toute décision hors plan, attends 24 heures avant d'agir.`],
@@ -2909,24 +3009,6 @@ const GLOSSARY=[
 ['Duration','Mesure de la sensibilité d\'une obligation aux taux : plus elle est longue, plus le prix varie quand les taux bougent.']
 ];
 
-const MODELS={
-  prudent:{name:'Prudent',rows:[
-    {label:'Matelas de sécurité',kind:'livret_a',pct:60,note:'Livret A / LDDS / LEP'},
-    {label:'Fonds en euros',kind:'assurance_vie',pct:25,note:'Assurance-vie, capital garanti'},
-    {label:'ETF Monde',kind:'pea',pct:15,note:'Petite part en actions pour apprendre'}]},
-  equilibre:{name:'Équilibré',rows:[
-    {label:'Matelas de sécurité',kind:'livret_a',pct:30,note:'Livret A / LDDS / LEP'},
-    {label:'Assurance-vie',kind:'assurance_vie',pct:20,note:'Mix fonds en euros et UC'},
-    {label:'ETF Monde',kind:'pea',pct:50,note:'Cœur du portefeuille'}]},
-  offensif:{name:'Offensif',rows:[
-    {label:'Matelas de sécurité',kind:'livret_a',pct:10,note:'Une fois le matelas de 3 à 6 mois atteint'},
-    {label:'ETF Monde',kind:'pea',pct:75,note:'Investissement programmé'},
-    {label:'ETF Europe / émergents',kind:'pea',pct:15,note:'Diversification complémentaire'}]},
-  dynamique:{name:'Dynamique',rows:[
-    {label:'Matelas de sécurité',kind:'livret_a',pct:20,note:'Une fois le matelas de 3 à 6 mois atteint'},
-    {label:'ETF Monde',kind:'pea',pct:70,note:'Investissement programmé'},
-    {label:'ETF Europe / émergents',kind:'pea',pct:10,note:'Diversification complémentaire'}]}
-};
 
 /* ---------- graphiques & simulateurs ---------- */
 function shortEur(n){return n>=1e6?(n/1e6).toFixed(1).replace('.',',')+' M€':(n>=1000?Math.round(n/1000)+' k€':Math.round(n)+' €');}
@@ -3062,37 +3144,13 @@ async function saveLearn(patch){
   return act('saveSettings',{values:{learn:JSON.stringify(ls)}});
 }
 
-function openRow(id){
-  const r=id?(sd().rows||[]).find(x=>x.id===id):null;
-  rowDraft=r?Object.assign({},r):{id:'',label:'',kind:'pea',pct:'',note:''};
-  drawRow();
-}
-function readRow(){
-  const l=$('#f_rl');if(l)rowDraft.label=l.value;
-  const p=$('#f_rp');if(p)rowDraft.pct=p.value;
-  const n=$('#f_rn');if(n)rowDraft.note=n.value;
-  const k=$('#f_rk');if(k)rowDraft.kind=k.value;
-}
-function drawRow(){
-  const d=rowDraft,isNew=!d.id;
-  openSheet('<h3>'+(isNew?'Nouvelle ligne':'Modifier la ligne')+'</h3>'+
-    '<div class="field"><label for="f_rl">Nom</label><input id="f_rl" maxlength="50" value="'+esc(d.label)+'" placeholder="Ex. ETF Monde"></div>'+
-    '<div class="two"><div class="field"><label for="f_rk">Enveloppe</label><select id="f_rk">'+Object.keys(KINDS).map(k=>'<option value="'+k+'"'+(d.kind===k?' selected':'')+'>'+esc(KINDS[k].label)+'</option>').join('')+'</select></div>'+
-    '<div class="field"><label for="f_rp">Part (%)</label><input id="f_rp" inputmode="decimal" value="'+esc(String(d.pct).replace('.',','))+'" placeholder="0"></div></div>'+
-    '<div class="field"><label for="f_rn">Note</label><input id="f_rn" maxlength="80" value="'+esc(d.note)+'" placeholder="Optionnel"></div>'+
-    '<div class="sheet-actions">'+(isNew?'<button class="btn ghost" data-act="closeSheet">Annuler</button>':'<button class="btn danger" data-act="stratDel" style="flex:0 0 auto">Supprimer</button>')+'<button class="btn" data-act="stratRowSave">Enregistrer</button></div>',{key:'row',focus:isNew?'#f_rl':null});
-}
-
-
 
 /* =====================================================================
    BOURSE v4 : profil investisseur, stratégie, portefeuille, outils
    ===================================================================== */
 function sd(){if(!UI.sd)UI.sd=strategyState();return UI.sd;}
-let rowDraft=null;
 const isSafeKind=k=>(KINDS[k]||KINDS.autre).safe;
 const kindLabel=k=>(KINDS[k]||KINDS.autre).label;
-const kindColor=k=>(KINDS[k]||KINDS.autre).color;
 
 const INVESTOR={
   prudent:{label:'Prudent',range:'10 à 30 %',color:C.teal,model:'prudent',
@@ -3144,83 +3202,29 @@ function showQuizResult(){
     '<div class="panel pad" style="margin-top:12px"><div class="small muted">Part d\'actions habituelle pour l\'argent investi à long terme</div><div style="font:700 26px var(--font);letter-spacing:-.02em">'+inv.range+'</div><p class="muted" style="margin:8px 0 0">'+esc(inv.txt)+'</p></div>'+
     (p.capped?'<div class="callout warn"><b>Horizon court</b>Tu as besoin de cet argent dans moins de 3 ans : la bourse n\'est pas adaptée, car une baisse peut ne pas avoir le temps d\'être rattrapée. Je te classe en Prudent, avec des livrets en priorité.</div>':'')+
     '<p class="help">Ce test est pédagogique : il ne remplace pas un conseil personnalisé. Il sert à poser un cadre, que tu peux ajuster.</p>'+
-    '<div class="sheet-actions"><button class="btn ghost" data-act="closeSheet">Garder mon allocation</button><button class="btn" data-act="stratModel" data-id="'+inv.model+'">Charger le modèle</button></div>',{key:'quizres'});
+    '<div class="sheet-actions"><button class="btn ghost" data-act="closeSheet">Fermer</button><button class="btn" data-act="profileApply">Appliquer à mon épargne</button></div>',{key:'quizres'});
 }
 
-/* ---------- stratégie ---------- */
-function donutSvg(rows){
-  const total=sum(rows,r=>+r.pct||0);
-  if(!(total>0))return '';
-  let a=0,s='<svg viewBox="0 0 160 160" style="width:150px;height:150px;flex:none" role="img" aria-label="Répartition cible">';
-  rows.forEach(r=>{
-    const p=(+r.pct||0);if(p<=0)return;
-    const span=p/total*360,g=rows.length>1?2:0;
-    s+='<path d="'+arcPath(80,80,60,a+g/2,a+span-g/2)+'" fill="none" stroke="'+kindColor(r.kind)+'" stroke-width="22"/>';
-    a+=span;
-  });
-  return s+'<text x="80" y="87" text-anchor="middle" style="font:700 22px var(--font);fill:var(--ink)">'+Math.round(total)+' %</text></svg>';
-}
-function strategyView(){
-  const d=sd(),rows=d.rows||[];
-  const total=sum(rows,r=>+r.pct||0);
-  const c=currentCycle(),st=c?stats(c):null;
-  const risks=['Prudent','Modéré','Équilibré','Dynamique','Offensif'];
+/* ---------- Mon profil ---------- */
+function profileView(){
+  const d=sd(),p=d.profile&&INVESTOR[d.profile.key]?d.profile:null;
   let h='';
-  if(d.profile&&INVESTOR[d.profile.key]){
-    const inv=INVESTOR[d.profile.key];
-    h+='<button class="panel pad" style="display:block;width:100%;text-align:left;border:0" data-act="qzShow"><div class="small muted">Ton profil investisseur</div><div style="display:flex;align-items:baseline;gap:10px"><span style="font:700 26px var(--font);letter-spacing:-.02em;color:'+inv.color+'">'+inv.label+'</span><span class="muted small">actions : '+inv.range+'</span></div><div style="margin-top:8px">'+bar((d.profile.score-6)/18,inv.color)+'</div><div class="small muted" style="margin-top:6px">Test du '+dLong(d.profile.date)+' · touche pour revoir</div></button>';
+  if(p){
+    const inv=INVESTOR[p.key],share={prudent:20,equilibre:45,dynamique:70,offensif:90}[p.key];
+    h+='<section class="panel pad"><div class="small muted">Ton profil investisseur</div><div style="font:700 34px var(--font);letter-spacing:-.03em;color:'+inv.color+'">'+inv.label+'</div>'+
+      '<div style="margin:10px 0 6px">'+bar((p.score-6)/18,inv.color,{thick:true})+'<div class="env-f"><span>Prudent</span><span>Offensif</span></div></div>'+
+      '<p style="margin:10px 0 0">'+esc(inv.txt)+'</p>'+
+      '<div class="panel pad" style="margin-top:14px;background:var(--surface2);box-shadow:none"><div class="small muted">Pour l\'argent que tu places à long terme</div><div style="display:flex;gap:16px;margin-top:6px"><div><b style="font:700 24px var(--font)">'+share+' %</b><div class="small muted">en bourse (PEA…)</div></div><div><b style="font:700 24px var(--font)">'+(100-share)+' %</b><div class="small muted">en sécurité (livrets)</div></div></div></div>'+
+      '<div style="display:grid;gap:10px;margin-top:14px"><button class="btn block" data-act="profileApply">Appliquer à ma répartition d\'épargne</button><button class="btn ghost block" data-act="qzStart">Refaire le test</button></div>'+
+      '<p class="help">Test du '+dLong(p.date)+'. C\'est un repère pédagogique, pas un conseil personnalisé.</p></section>';
   }else{
-    h+='<div class="panel pad"><div style="font:700 19px var(--font)">Quel investisseur es-tu ?</div><p class="muted" style="margin:6px 0 12px">6 questions pour poser un cadre : horizon, réaction aux baisses, objectifs. Tu obtiens un profil et un modèle d\'allocation à ajuster.</p><button class="btn block" data-act="qzStart">Faire le test (2 min)</button></div>';
+    h+='<section class="panel pad"><div style="font:700 21px var(--font)">Quel investisseur es-tu ?</div><p class="muted" style="margin:6px 0 14px">6 questions simples (ton horizon, ta réaction aux baisses…). Tu obtiens un profil et une répartition conseillée entre bourse et sécurité, que l\'appli peut appliquer pour toi.</p><button class="btn block" data-act="qzStart">Faire le test (2 min)</button></section>';
   }
-  h+='<section class="sec"><div class="panel pad"><div class="field" style="margin-top:0"><label for="st_goal">Mon objectif</label><input id="st_goal" data-act="stratField" data-id="goal" maxlength="120" value="'+esc(d.goal)+'" placeholder="Ex. Constituer un apport dans 8 ans"></div>'+
-    '<div class="two"><div class="field" style="margin:0"><label for="st_h">Horizon (années)</label><input id="st_h" data-act="stratField" data-id="horizon" inputmode="numeric" value="'+esc(d.horizon)+'"></div><div></div></div>'+
-    '<div class="lbl2" style="margin-top:14px">Ma tolérance à la baisse</div><div class="chips" style="margin-top:8px">'+risks.map((r,i)=>'<button class="chip" data-act="stratRisk" data-id="'+(i+1)+'" aria-pressed="'+(+d.risk===i+1)+'">'+r+'</button>').join('')+'</div></div></section>';
-
-  h+='<section class="sec"><div class="sec-h"><h2>Allocation cible</h2><button class="link" data-act="stratAdd">Ajouter</button></div>';
-  if(rows.length){
-    h+='<div class="panel pad"><div style="display:flex;gap:16px;align-items:center">'+donutSvg(rows)+'<div style="flex:1;min-width:0">'+
-      rows.map(r=>'<button class="row nobadge" style="padding:8px 0;min-height:0" data-act="stratEdit" data-id="'+esc(r.id)+'"><span style="width:10px;height:10px;border-radius:50%;background:'+kindColor(r.kind)+';flex:none"></span><div class="grow"><div class="t" style="font-size:15px">'+esc(r.label)+'</div><div class="s">'+esc(kindLabel(r.kind))+'</div></div><div class="amt">'+Math.round(+r.pct||0)+' %</div></button>').join('')+'</div></div>'+
-      (Math.round(total)!==100?'<div class="callout warn" style="margin-bottom:0"><b>Total : '+Math.round(total)+' %</b>Les parts sont proportionnelles : '+(total>0?'avec ce total, chaque ligne pèse '+Math.round(100/total*100)/100+' fois sa part.':'ajuste tes lignes.')+'</div>':'')+'</div>';
-  }else h+='<div class="panel pad muted">Aucune ligne. Ajoute-en une, passe le test ou pars d\'un modèle ci-dessous.</div>';
-  h+='<div class="lbl2" style="margin-top:14px">Partir d\'un modèle pédagogique</div><div class="chips" style="margin-top:8px">'+Object.keys(MODELS).map(k=>'<button class="chip" data-act="stratModel" data-id="'+k+'">'+MODELS[k].name+'</button>').join('')+'</div>'+
-    '<p class="help">Exemples pour comprendre, pas un conseil personnalisé. Les pourcentages sont des repères : ajuste-les, ils peuvent évoluer avec ta situation.</p></section>';
-
-  if(c&&c.savings>0){
-    const al=allocate(c.savings,{cushionFirst:d.cushionFirst!==false});
-    h+='<section class="sec"><div class="sec-h"><h2>Mon plan ce cycle</h2><span class="cap num">'+eur(c.savings)+'</span></div><div class="list">'+
-      (al.lines.length?al.lines.map(l=>{const lv=livretById(l.livretId);return '<div class="row" style="align-items:flex-start"><span class="badge" style="background:'+(lv?lv.color:C.green)+'26;color:'+(lv?lv.color:C.green)+';font-weight:700;font-size:12px">'+esc(lv?kindLabel(lv.kind).slice(0,3):'🌱')+'</span><div class="grow"><div class="t">'+esc(lv?lv.name:'Livret')+'</div><div class="s" style="white-space:normal">'+esc(l.why)+'</div></div><div class="amt">'+eurR(l.amount)+'</div></div>';}).join(''):'<div class="row nobadge muted">Aucun livret ne peut recevoir de versement pour le moment.</div>')+
-      (al.kept>=1?'<div class="row nobadge"><div class="grow"><div class="t">Non placé</div><div class="s" style="white-space:normal">Plafonds atteints ou livrets en pause : cet argent reste sur ton compte.</div></div><div class="amt">'+eurR(al.kept)+'</div></div>':'')+
-      '<div class="row nobadge" style="padding:6px 16px"><div class="grow"><div class="t">Matelas d\'abord</div><div class="s">Complète 3 mois de dépenses avant la bourse</div></div>'+switchHtml(d.cushionFirst!==false,'data-act="stratCushion"')+'</div></div>'+
-      (al.skipped.length?'<div class="callout" style="margin-top:12px"><b>Non alimentés</b>'+al.skipped.map(x=>esc(x.name)+' : '+esc(x.why)).join('<br>')+'</div>':'')+
-      '<div style="margin-top:12px"><button class="btn ghost block" data-act="tool" data-id="next">Calculer un autre versement</button></div></section>';
-  }
-
-  const act=S.livrets.filter(l=>l.active),tot=sum(act,l=>livretValue(l));
-  const kinds=[];rows.forEach(r=>{if(kinds.indexOf(r.kind)<0)kinds.push(r.kind);});act.forEach(l=>{if(kinds.indexOf(l.kind)<0)kinds.push(l.kind);});
-  if(kinds.length&&(rows.length||tot>0)){
-    const tol=+d.tol||5;
-    h+='<section class="sec"><div class="sec-h"><h2>Réel et cible</h2></div><div class="panel pad">';
-    if(!(tot>0))h+='<p class="muted" style="margin:0">Ajoute des soldes dans l\'onglet Épargne pour comparer ta répartition actuelle à ta cible.</p>';
-    else{
-      let alerts=0;
-      h+=kinds.map(k=>{
-        const tgt=total>0?sum(rows.filter(r=>r.kind===k),r=>+r.pct||0)/total*100:0;
-        const real=sum(act.filter(l=>l.kind===k),l=>livretValue(l))/tot*100;
-        const dev=real-tgt,off=rows.length&&Math.abs(dev)>tol;
-        if(off)alerts++;
-        const accts=act.filter(l=>l.kind===k),full=accts.length&&accts.every(l=>!canReceive(l));
-        return '<div style="margin-bottom:14px"><div class="env-h" style="margin-bottom:6px"><span class="n">'+esc(kindLabel(k))+(full?' <span class="tag">'+(accts.every(l=>l.paused)?'en pause':'plafond atteint')+'</span>':'')+'</span><span class="small muted num">actuel '+Math.round(real)+' % · cible '+Math.round(tgt)+' %</span></div>'+bar(real/100,kindColor(k),{tick:tgt/100})+
-          (off?'<div class="small" style="color:var(--warn);font-weight:600;margin-top:5px">'+(dev>0?'Au-dessus':'En dessous')+' de la cible de '+Math.round(Math.abs(dev))+' points</div>':'')+'</div>';
-      }).join('')+'<div class="small muted">Le trait sombre marque ta cible. Tolérance avant alerte :</div><div class="chips" style="margin-top:8px">'+[3,5,10].map(n=>'<button class="chip" data-act="stratTol" data-id="'+n+'" aria-pressed="'+(tol===n)+'">±'+n+' pts</button>').join('')+'</div>'+
-        (alerts?'<p class="help" style="color:var(--warn)">'+alerts+' ligne'+(alerts>1?'s':'')+' s\'écarte'+(alerts>1?'nt':'')+' de la cible. Oriente tes prochains versements vers ce qui est en dessous : l\'outil « Mon prochain versement » le fait pour toi.</p>':'<p class="help">Tout est dans la tolérance. Tant que le matelas n\'est pas fait, il est normal d\'avoir plus de sécurité que prévu.</p>');
-    }
-    h+='</div></section>';
-  }
-
-  h+='<section class="sec"><div class="sec-h"><h2>Mes règles</h2></div><div class="field" style="margin-top:0"><textarea id="st_rules" data-act="stratField" data-id="rules" maxlength="1200" placeholder="Ex. Je ne vends pas pendant une baisse. J\'investis le même montant à chaque cycle. Je rééquilibre une fois par an.">'+esc(d.rules)+'</textarea></div></section>';
-  h+='<section class="sec"><div class="panel pad"><div class="kv"><span>Dernière revue</span><b>'+(d.reviewed?dLong(d.reviewed):'jamais')+'</b></div>'+
-    (d.reviewed?'<div class="kv"><span>Prochaine revue conseillée</span><b>'+dLong(D.add(d.reviewed,182))+'</b></div>':'')+
-    '<div class="sheet-actions"><button class="btn ghost" data-act="stratReview">J\'ai relu ma stratégie</button><button class="btn" data-act="stratSave">Enregistrer</button></div></div></section>';
+  const st=strategyState(),plan=st.plan||{},tot=sum(Object.keys(plan),k=>+plan[k]);
+  h+='<section class="sec"><div class="sec-h"><h2>Ma répartition d\'épargne</h2><button class="link" data-act="planEdit">Modifier</button></div><div class="list">'+
+    (tot>0?Object.keys(plan).map(id=>{const l=livretById(id);if(!l)return '';return '<div class="row"><span class="badge" style="background:'+l.color+'26;color:'+l.color+';font-weight:700;font-size:13px">'+esc(kindLabel(l.kind).slice(0,2))+'</span><div class="grow"><div class="t">'+esc(l.name)+'</div><div class="s">'+(isSafeKind(l.kind)?'sécurité':'bourse')+(l.paused?' · ⏸ en pause':'')+'</div></div><div class="amt">'+Math.round(plan[id]/tot*100)+' %</div></div>';}).join(''):'<div class="row nobadge muted">Aucune répartition pour l\'instant.</div>')+
+    '</div><p class="help">C\'est elle qui décide où va ton épargne à chaque cycle (onglet Épargne › Ce cycle).</p></section>';
+  h+='<section class="sec"><div class="sec-h"><h2>Mes règles</h2></div><div class="field" style="margin-top:0"><textarea id="st_rules" data-act="stratField" data-id="rules" maxlength="1200" placeholder="Ex. Je ne vends pas pendant une baisse. J\'investis le même montant à chaque cycle.">'+esc(d.rules)+'</textarea></div><button class="btn ghost block" data-act="rulesSave">Enregistrer mes règles</button></section>';
   return h;
 }
 
@@ -3228,7 +3232,7 @@ function strategyView(){
 function investAccounts(){return S.livrets.filter(l=>l.active&&!isSafeKind(l.kind));}
 function portfolioView(){
   const acc=investAccounts();
-  if(!acc.length)return '<div class="empty"><h2>Aucun compte de bourse</h2><p>Ajoute un PEA, une assurance-vie ou un compte-titres dans l\'onglet Épargne pour suivre ta performance.</p><button class="btn" data-act="gotoSave">Aller dans Épargne</button></div>';
+  if(!acc.length)return '<div class="empty"><h2>Aucun compte de bourse</h2><p>Ajoute un PEA, une assurance-vie ou un compte-titres dans l\'onglet Épargne pour suivre ta performance.</p><button class="btn" data-act="addLivretKind" data-id="pea">Ajouter un PEA</button></div>';
   const invested=sum(acc,l=>investedAt(l,S.today)),value=sum(acc,l=>livretValue(l));
   const gain=value-invested,pct=invested>0?gain/invested*100:0;
   const anyValue=acc.some(l=>l.marketValue!=null);
@@ -3287,7 +3291,7 @@ function simulateYears(init,monthly,years,ratePct,crash,infl){
 function plannedInvestMonthly(){
   const c=currentCycle();
   if(c&&c.savings>0){
-    const al=allocate(c.savings,{cushionFirst:false});
+    const al=allocate(c.savings,{});
     const inv=sum(al.lines.filter(l=>{const lv=livretById(l.livretId);return lv&&!isSafeKind(lv.kind);}),l=>l.amount);
     if(inv>0)return Math.round(inv);
     return Math.max(10,Math.round(c.savings/10)*10);
@@ -3298,7 +3302,6 @@ function toolsView(){
   const tools=[
     ['sim','📈','Simulateur de scénarios','Pessimiste, médian, optimiste… et même un krach'],
     ['goal','🎯','Combien épargner pour un objectif ?','Calcule ton versement mensuel'],
-    ['next','🧭','Mon prochain versement','Où le placer, plafonds respectés'],
     ['etf','✅','Check-list avant d\'acheter un ETF','8 points à vérifier'],
     ['calc','🧮','Calculettes','Performance annualisée, baisse, frais']
   ];
@@ -3308,7 +3311,6 @@ function toolsView(){
 function openTool(id){
   if(id==='sim')return openToolSim();
   if(id==='goal')return openToolGoal();
-  if(id==='next')return openToolNext();
   if(id==='etf')return openToolEtf();
   if(id==='calc')return openToolCalc();
 }
@@ -3368,25 +3370,6 @@ function openToolGoal(){
       box.querySelectorAll('input').forEach(i=>i.addEventListener('input',run));run();
     }});
 }
-function nextAmountDefault(){
-  const c=currentCycle();
-  if(!c)return 100;
-  const st=stats(c),rest=Math.max(0,c.savings-st.savedNet);
-  return Math.round(rest>0?rest:c.savings)||100;
-}
-function nextHtml(amount){
-  const al=allocate(amount,{useGap:true});
-  return (al.lines.length?'<div class="list" style="margin-top:12px">'+al.lines.map(l=>{const lv=livretById(l.livretId);return '<div class="row" style="align-items:flex-start"><span class="badge" style="background:'+(lv?lv.color:C.green)+'26;color:'+(lv?lv.color:C.green)+';font-weight:700;font-size:12px">'+esc(lv?kindLabel(lv.kind).slice(0,3):'🌱')+'</span><div class="grow"><div class="t">'+esc(lv?lv.name:'Livret')+'</div><div class="s" style="white-space:normal">'+esc(l.why)+'</div></div><div class="amt pos">+'+eurR(l.amount)+'</div></div>';}).join('')+'</div>':'<div class="callout warn"><b>Rien à placer</b>Aucun livret ne peut recevoir de versement (plafonds atteints ou versements en pause).</div>')+
-    (al.kept>=1&&al.lines.length?'<p class="help">'+eurR(al.kept)+' ne peuvent pas être placés (plafonds atteints ou livrets en pause) : ils restent sur ton compte.</p>':'')+
-    (al.skipped.length?'<div class="callout" style="margin-top:10px"><b>Non alimentés</b>'+al.skipped.map(x=>esc(x.name)+' : '+esc(x.why)).join('<br>')+'</div>':'')+
-    (al.gap>0&&al.cushionFirst?'<p class="help">Ton matelas de sécurité vise 3 mois de dépenses : il te manque '+eurR(al.gap)+', donc il passe en premier.</p>':'');
-}
-function openToolNext(){
-  const amount=nextAmountDefault();
-  openSheet('<h3>Mon prochain versement</h3><p class="lead">Indique la somme à placer : je te dis où la mettre, en respectant les plafonds, les livrets en pause, ton matelas et ta stratégie.</p>'+
-    '<div class="field"><input id="tn_amt" class="amount" inputmode="decimal" value="'+amount+'" data-act="nextAmt" aria-label="Montant à placer"></div><div id="tn_out">'+nextHtml(amount)+'</div>'+
-    '<div class="sheet-actions"><button class="btn ghost" data-act="closeSheet">Fermer</button><button class="btn" data-act="nextApply">Enregistrer ces virements</button></div>',{key:'tool',tall:true});
-}
 const ETF_CHECKS=[
   'Il suit un indice large (monde, Europe, S&P 500…)',
   'Ses frais courants (TER) sont inférieurs à environ 0,4 %',
@@ -3439,13 +3422,14 @@ function glossaryView(){
     (list.length?'<div class="panel pad" style="padding-top:4px;padding-bottom:4px">'+list.map(g=>'<div class="term"><b>'+esc(g[0])+'</b><span class="muted">'+esc(g[1])+'</span></div>').join('')+'</div>':'<div class="empty"><h2>Aucun résultat</h2><p>Essaie un autre mot.</p></div>');
 }
 function viewLearn(){
-  const tabs=[['parcours','Apprendre'],['strat','Stratégie'],['folio','Portefeuille'],['tools','Outils']];
-  let h='<div class="seg" role="group" aria-label="Section" style="font-size:13px">'+tabs.map(t=>'<button data-act="learnTab" data-id="'+t[0]+'" aria-pressed="'+(UI.learn===t[0])+'" style="font-size:13px">'+t[1]+'</button>').join('')+'</div><div style="height:16px"></div>';
-  if(UI.learn==='strat')return h+strategyView();
+  if(UI.learn==='strat')UI.learn='profil';
+  if(UI.learn==='tools')UI.learn='parcours';
+  const tabs=[['parcours','Apprendre'],['profil','Mon profil'],['folio','Mes placements']];
+  let h='<div class="seg" role="group" aria-label="Section">'+tabs.map(t=>'<button data-act="learnTab" data-id="'+t[0]+'" aria-pressed="'+(UI.learn===t[0])+'">'+t[1]+'</button>').join('')+'</div><div style="height:16px"></div>';
+  if(UI.learn==='profil')return h+profileView();
   if(UI.learn==='folio')return h+portfolioView();
-  if(UI.learn==='tools')return h+toolsView();
   if(UI.glossOpen)return h+glossaryView();
-  return h+lessonsView();
+  return h+lessonsView()+'<section class="sec"><div class="sec-h"><h2>Outils</h2></div>'+toolsView()+'</section>';
 }
 function saveStrategy(msg){
   return act('saveSettings',{values:{strategy:JSON.stringify(sd())}},msg===null?null:(msg||'Stratégie enregistrée'));
@@ -3475,62 +3459,20 @@ Object.assign(ACT,{
     if(UI.quiz.a.length>=QUIZ.length)finishQuiz();
     else{UI.quiz.i++;drawQuiz();}
   },
-  stratRisk(el){sd().risk=+el.dataset.id;render();},
-  stratTol(el){sd().tol=+el.dataset.id;saveStrategy(null);},
-  stratAdd(){openRow(null);},
-  stratEdit(el){openRow(el.dataset.id);},
-  async stratRowSave(){
-    readRow();
-    const d=rowDraft,p=parseNum(d.pct);
-    if(!d.label.trim()){toast('Donne un nom à la ligne.',true);return;}
-    if(!isFinite(p)||p<0||p>100){toast('Part invalide (0 à 100 %).',true);return;}
-    const row={id:d.id||('r'+Date.now().toString(36)),label:d.label.trim(),kind:d.kind,pct:p,note:d.note.trim()};
-    const rows=sd().rows=sd().rows||[];
-    const i=rows.findIndex(x=>x.id===row.id);
-    if(i>=0)rows[i]=row;else rows.push(row);
-    const r=await saveStrategy('Ligne enregistrée');
-    if(r)closeSheet();
-  },
-  stratDel(){
-    const id=rowDraft.id;
-    askConfirm('Supprimer cette ligne ?','Elle sera retirée de ton allocation cible. Tu pourras annuler juste après.','Supprimer',async()=>{
-      sd().rows=(sd().rows||[]).filter(x=>x.id!==id);
-      const r=await saveStrategy('Ligne supprimée');if(r)closeSheet();
-    },true);
-  },
-  stratModel(el){
-    const m=MODELS[el.dataset.id];if(!m)return;
-    const apply=async()=>{
-      sd().rows=m.rows.map((r,i)=>Object.assign({id:'m'+i+Date.now().toString(36)},r));
-      const r=await saveStrategy('Modèle « '+m.name+' » chargé');if(r)closeSheet();
-    };
-    if((sd().rows||[]).length&&UI.sheetKey!=='quizres')askConfirm('Remplacer ton allocation ?','Le modèle « '+m.name+' » remplacera tes lignes actuelles. Tu pourras ensuite les modifier.','Remplacer',apply);
-    else apply();
-  },
-  stratReview(){sd().reviewed=S.today;saveStrategy('Revue enregistrée');},
-  stratSave(){saveStrategy();},
   tool(el){openTool(el.dataset.id);},
   valuesOpen(){openValues();},
   valuesSave(){saveValues();},
-  nextApply(){
-    const a=parseNum(val('tn_amt'));
-    if(!isFinite(a)||a<=0){toast('Indique le montant à placer.',true);return;}
-    const al=allocate(a,{useGap:true});
-    if(!al.lines.length){toast('Rien à enregistrer.',true);return;}
-    act('applyBilan',{date:S.today,lines:al.lines.map(l=>({livretId:l.livretId,amount:l.amount,label:'Versement planifié',support:l.support}))},'Virements enregistrés',true).then(r=>{if(r)closeSheet();});
-  }
+  rulesSave(){saveStrategy('Règles enregistrées');}
 });
 document.addEventListener('input',e=>{
   const el=e.target;if(!el||!el.dataset||!el.dataset.act)return;
   const a=el.dataset.act;
   if(a==='stratField'){const k=el.dataset.id;sd()[k]=(k==='horizon')?(parseInt(el.value,10)||''):el.value;}
   else if(a==='glossQ'){UI.glossQ=el.value;UI.refocus='gq';render();}
-  else if(a==='nextAmt'){const v=parseNum(el.value),o=$('#tn_out');if(o)o.innerHTML=isFinite(v)&&v>0?nextHtml(v):'<p class="help">Indique un montant.</p>';}
 });
 document.addEventListener('change',e=>{
   const el=e.target;if(!el||!el.dataset)return;
-  if(el.dataset.act==='stratCushion'){sd().cushionFirst=el.checked;saveStrategy(null);}
-  else if(el.dataset.act==='etfChk')updateEtf();
+  if(el.dataset.act==='etfChk')updateEtf();
 });
 
 /* =====================================================================
@@ -4098,8 +4040,8 @@ const TOUR=[
  {e:'🎚️',c:'#AF52DE',t:'Prévu et utilisé',x:'Dans Budget, chaque enveloppe a un montant prévu que tu règles en euros, et un montant utilisé (ce que tu as vraiment dépensé). Tes montants sont conservés : rien ne se recalcule tout seul. Si de l\'argent n\'est dans aucune enveloppe, touche « Répartir le reste ».',go:['Ouvrir Budget','tab:budget'],vis:'sliders'},
  {e:'🔁',c:'#30B0C7',t:'Prélèvements, aides et cadeaux',x:'Ajoute tes prélèvements (loyer, téléphone…) : ils sont comptés tout seuls à chaque cycle. Pour un cadeau ou une aide exceptionnelle, ajoute une « rentrée » avec le +, et choisis combien en mettre de côté.'},
  {e:'🎈',c:'#FF2D55',t:'Le bilan de fin de cycle',x:'Dans les derniers jours, l\'appli estime ce que tu n\'auras pas dépensé et te propose où le placer : d\'abord ton matelas de sécurité, puis ta stratégie. Elle respecte les plafonds de tes livrets et ceux que tu as mis en pause.'},
- {e:'🌱',c:'#34C759',t:'Épargne et objectifs',x:'Ajoute tes livrets avec leur plafond et leur taux. Tu peux dire « ne plus y verser » à tout moment. Crée des objectifs (voyage, permis…) : un anneau suit ta progression.',go:['Ouvrir Épargne','tab:save']},
- {e:'📈',c:'#5856D6',t:'La bourse, pas à pas',x:'12 leçons courtes, un test pour connaître ton profil d\'investisseur, ta stratégie écrite, le suivi de la valeur de ton PEA et des simulateurs de scénarios (même avec un krach).',go:['Ouvrir Bourse','tab:learn']},
+ {e:'🌱',c:'#34C759',t:'Épargne et objectifs',x:'Choisis une fois ta répartition (ex. 50 % Livret A, 50 % PEA) : à chaque cycle, l\'appli te dit combien virer sur chaque compte, et un bouton enregistre tout d\'un coup. Plafonds et comptes en pause sont respectés.',go:['Ouvrir Épargne','tab:save']},
+ {e:'📈',c:'#5856D6',t:'La bourse, pas à pas',x:'12 leçons courtes, un test pour connaître ton profil d\'investisseur (il peut remplir ta répartition d\'épargne), le suivi de tes placements et des simulateurs.',go:['Ouvrir Bourse','tab:learn']},
  {e:'✨',c:'#AF52DE',t:'Pose-lui tes questions',x:'Touche l\'étoile en haut à droite : « Combien il me reste ? », « Puis-je dépenser 50 € en fun ? », « Où en est mon essence ? ». L\'assistant répond avec tes chiffres, sans internet et sans abonnement.',go:['Ouvrir l\'assistant','assistant']},
  {e:'📊',c:'#007AFF',t:'La vue globale',x:'Le bouton à côté de l\'étoile ouvre un tableau de bord très visuel : flux de ta paie, santé financière, matelas de sécurité, patrimoine, calendrier de tes dépenses.',go:['Voir la vue globale','overview']},
  {e:'💾',c:'#8E8E93',t:'Tes données t\'appartiennent',x:'Tout reste sur ton téléphone. Exporte une sauvegarde de temps en temps depuis les réglages. Le thème clair ou sombre se règle aussi là.',faq:true}
