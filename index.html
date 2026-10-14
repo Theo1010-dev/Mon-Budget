@@ -343,6 +343,7 @@ details.fold .list{box-shadow:none;background:var(--surface2)}
 <div class="toast" id="toast" role="status"></div>
 <script>
 'use strict';
+const APP_VERSION='1.1 · 14 oct. 2026';
 
 /* =====================================================================
    1. UTILITAIRES
@@ -829,7 +830,7 @@ const Backend=(function(){
       return {id:p.id};
     },
     saveSettings(p){
-      const ok=['setupDone','cycleLen','strategy','learn','lastBackup','theme','hide','catRules','tourDone'];
+      const ok=['setupDone','cycleLen','strategy','learn','lastBackup','theme','hide','catRules','tourDone','hints'];
       const v=p.values||{};
       Object.keys(v).forEach(k=>{if(ok.indexOf(k)<0)throw new Error('Réglage inconnu : '+k);db.settings[k]=v[k]==null?'':String(v[k]);});
       return {saved:Object.keys(v)};
@@ -908,7 +909,7 @@ async function act(action,payload,okMsg,undoable){
   try{
     const r=await call(action,payload);
     S=r.state;UI.sd=null;
-    if(okMsg)toast(okMsg,false,undoable);
+    if(okMsg){toast(okMsg,false,undoable);try{if(navigator.vibrate)navigator.vibrate(8);}catch(e){}}
     render();
     return r;
   }catch(e){toast(e.message,true);return null;}
@@ -1356,6 +1357,19 @@ function opRow(o){
   return '<button class="row nobadge" data-act="editOp" data-id="'+esc(o.id)+'"><div class="grow"><div class="t">'+esc(o.label)+'</div><div class="s">'+dShort(o.date)+' · '+m.meta+'</div></div><div class="amt'+m.cls+'">'+m.amt+'</div></button>';
 }
 
+const SCREEN_HINTS={
+  budget:'Ici tu décides combien va dans chaque enveloppe (le prévu) et tu vois ce que tu as vraiment dépensé (l\'utilisé). Touche une ligne pour changer un montant.',
+  hist:'Toutes tes opérations, et le bilan de chaque cycle passé. Touche une opération pour la modifier ou la supprimer.',
+  save:'Tes comptes d\'épargne. « Ce cycle » te dit combien virer et sur quel compte. Règle « Ma répartition » une fois, l\'appli s\'occupe du reste.',
+  learn:'Apprends la bourse à ton rythme, fais le test « Mon profil », puis suis tes placements. Tout est expliqué simplement.',
+  overview:'Tout ton argent en graphiques. Touche un jour du calendrier pour voir ce que tu as dépensé ce jour-là.'
+};
+function hintHtml(key){
+  let seen={};try{seen=JSON.parse(S.settings.hints||'{}');}catch(e){}
+  if(seen[key]||!SCREEN_HINTS[key])return '';
+  return '<div class="callout tip" style="margin:0 0 16px"><b>À quoi sert cet écran ?</b>'+esc(SCREEN_HINTS[key])+'<div style="margin-top:8px"><button class="link" data-act="hintOk" data-id="'+key+'" style="padding:0">OK, compris</button></div></div>';
+}
+
 /* =====================================================================
    7. ÉCRANS
    ===================================================================== */
@@ -1385,7 +1399,7 @@ function render(){
   else if(UI.tab==='save')html=viewSavings();
   else if(UI.tab==='overview')html=viewOverview();
   else html=viewLearn();
-  $('#view').innerHTML=html;
+  $('#view').innerHTML=hintHtml(UI.tab)+html;
   if(UI.tab==='home')UI.animated=true;
   afterRender();
 }
@@ -1708,7 +1722,7 @@ function drawAdd(focus){
     h+='<div class="field"><label for="f_label">D\'où vient cet argent ?</label><input id="f_label" maxlength="120" placeholder="Anniversaire, aide, remboursement…" value="'+esc(d.label)+'"></div><p class="help">Cet argent s\'ajoute entièrement à ton budget. Ajoute un livret dans l\'onglet Épargne pour pouvoir en mettre une part de côté.</p>';
   }else if(d.type==='revenu'){
     h+='<div class="field"><label for="f_label">D\'où vient cet argent ?</label><input id="f_label" maxlength="120" placeholder="Anniversaire, aide, remboursement…" value="'+esc(d.label)+'"></div>'+
-      '<div class="lbl2">Part à mettre de côté : <b id="shareLbl">'+Math.round(d.sharePct)+' %</b></div><div class="chips" style="margin-top:8px"><button class="chip" data-act="opShare" data-id="0">Rien</button><button class="chip" data-act="opShare" data-id="50">50 %</button><button class="chip" data-act="opShare" data-id="100">Tout</button></div>'+
+      '<div class="lbl2">Part à mettre de côté : <b id="shareLbl">'+Math.round(d.sharePct)+' %</b></div><div class="chips" style="margin-top:8px">'+[['0','Rien'],['50','50 %'],['100','Tout']].map(x=>'<button class="chip" data-act="opShare" data-id="'+x[0]+'" aria-pressed="'+(Math.round(d.sharePct)===+x[0])+'">'+x[1]+'</button>').join('')+'</div>'+
       '<input type="range" id="f_tos" data-act="opTos" min="0" max="100" step="5" value="'+Math.round(d.sharePct)+'" aria-label="Part épargnée en pourcentage" style="margin-top:6px">'+
       '<p class="help" id="revSum" style="margin-top:0">'+esc(revenuSummary())+'</p>'+
       '<div class="row nobadge" style="padding:6px 0"><div class="grow"><div class="t">Ajouter le reste à mes enveloppes</div><div class="s" style="white-space:normal">Sinon il reste « à répartir » dans Budget</div></div>'+switchHtml(d.distribute!==false,'id="f_dist"')+'</div>'+
@@ -2188,6 +2202,7 @@ function openSettings(){
     '<button class="row nobadge" data-act="exportCsv"><div class="grow"><div class="t">Exporter mes opérations</div><div class="s">Fichier CSV à ouvrir dans Excel ou Google Sheets</div></div><span class="chev">›</span></button>'+
     '<button class="row nobadge" data-act="restore"><div class="grow"><div class="t">Restaurer une sauvegarde</div><div class="s">Remplace les données actuelles</div></div><span class="chev">›</span></button>'+
     '<button class="row nobadge" data-act="resetAll"><div class="grow"><div class="t" style="color:var(--neg)">Tout effacer</div></div></button></div>'+
+    '<div class="list" style="margin-top:18px"><button class="row nobadge" data-act="checkUpdate"><div class="grow"><div class="t">Rechercher une mise à jour</div><div class="s">Version installée : '+APP_VERSION+'</div></div><span class="chev">›</span></button></div>'+
     '<p class="help">Tes données restent uniquement sur ce téléphone. Pense à exporter une sauvegarde de temps en temps.'+(S.memOnly?' <b style="color:var(--neg)">Attention : le stockage est indisponible, rien ne sera conservé.</b>':'')+'</p>',{key:'settings'});
 }
 function openCycleLen(){
@@ -2351,6 +2366,9 @@ const ACT={
   settings(){openSettings();},
   toggleHide(){act('saveSettings',{values:{hide:S.settings.hide==='1'?'':'1'}});},
   theme(el){act('saveSettings',{values:{theme:el.dataset.id}}).then(()=>{if(UI.sheetKey==='settings')openSettings();});},
+  hintOk(el){let seen={};try{seen=JSON.parse(S.settings.hints||'{}');}catch(x){}seen[el.dataset.id]=1;act('saveSettings',{values:{hints:JSON.stringify(seen)}});},
+  gotoSave(){closeSheet();UI.tab='save';window.scrollTo(0,0);render();},
+  checkUpdate(){toast('Recherche de mise à jour…');const go=()=>location.reload();if(UI.swReg)UI.swReg.update().then(()=>setTimeout(go,800)).catch(go);else go();},
   gotoHist(){UI.tab='hist';UI.hist='ops';UI.filter={cycle:'all',cat:'all',q:'',lim:60};window.scrollTo(0,0);render();},
   undo(){
     $('#toast').classList.remove('on');
@@ -4135,7 +4153,13 @@ Object.assign(ACT,{exportCsv(){exportOpsCsv();}});
   render();
   if(/[?&]add=1/.test(location.search)&&S.settings.setupDone==='true'&&S.cycles.length)openAdd();
   if('serviceWorker' in navigator&&/^https?:$/.test(location.protocol)){
-    window.addEventListener('load',()=>{navigator.serviceWorker.register('sw.js').catch(()=>{});});
+    const hadCtrl=!!navigator.serviceWorker.controller;let reloaded=false;
+    /* quand une nouvelle version prend la main, on recharge une fois pour l'afficher */
+    navigator.serviceWorker.addEventListener('controllerchange',()=>{if(!hadCtrl||reloaded)return;reloaded=true;location.reload();});
+    window.addEventListener('load',()=>{
+      navigator.serviceWorker.register('sw.js',{updateViaCache:'none'}).then(reg=>{UI.swReg=reg;reg.update().catch(()=>{});}).catch(()=>{});
+    });
+    document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&UI.swReg)UI.swReg.update().catch(()=>{});});
   }
 })();
 
